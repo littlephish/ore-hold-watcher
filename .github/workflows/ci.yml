@@ -49,8 +49,10 @@ jobs:
             --enable-plugin=pyside6 `
             --windows-console-mode=disable `
             --windows-icon-from-ico=icon.ico `
-            --company-name="Jared" `
+            --company-name="LittlePhish" `
             --product-name="Ore Hold Watcher" `
+            --file-version="1.0.${{ github.run_number }}" `
+            --product-version="1.0.${{ github.run_number }}" `
             --output-filename=OreHoldWatcher.exe `
             --output-dir=build `
             app.py
