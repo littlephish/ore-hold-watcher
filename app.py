@@ -1093,8 +1093,9 @@ class MainWindow(QMainWindow):
         killed = self._force_close_eve()
         self.notifier.alert(
             "⏻ EVE downtime in <" + f"{lead.seconds // 60} min - clients closed",
-            f"Force-closed {killed} EVE client process(es) ahead of the "
-            f"{self.settings['downtime_utc']} UTC cluster shutdown.",
+            f"Force-closed {killed} process(es) (EVE clients plus their "
+            f"child processes) ahead of the {self.settings['downtime_utc']} "
+            f"UTC cluster shutdown.",
             {"event": "downtime_close", "processes_killed": killed})
 
     def _force_close_eve(self) -> int:
@@ -1105,8 +1106,10 @@ class MainWindow(QMainWindow):
         for name in names:
             try:
                 if sys.platform == "win32":
+                    # matches the community-standard downtime scheduled task:
+                    # taskkill /f /t /im exefile.exe (/T kills child processes)
                     r = subprocess.run(
-                        ["taskkill", "/F", "/IM", name],
+                        ["taskkill", "/f", "/t", "/im", name],
                         capture_output=True, text=True, timeout=30,
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                     out = (r.stdout or "") + (r.stderr or "")
@@ -1286,7 +1289,13 @@ class MainWindow(QMainWindow):
             else "color: #949ba4;")
 
         max_pct = max((c.pct for c in chars), default=0.0)
-        self.tray.setIcon(make_tray_icon(max_pct))
+        gauge = make_tray_icon(max_pct)
+        self.tray.setIcon(gauge)
+        self.setWindowIcon(gauge)  # taskbar button shows the same live gauge
+        if chars:
+            self.setWindowTitle(f"{APP_NAME} - {max_pct:.0f}%")
+        else:
+            self.setWindowTitle(APP_NAME)
         def tip_line(c):
             eta = c.eta_full_s()
             return (f"{c.pct:.1f}%  {c.name}" +

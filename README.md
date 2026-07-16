@@ -69,6 +69,20 @@ because the rate is measured from the character's real cycles. The status
 line and tray tooltip show which hold fills first fleet-wide. A pilot with
 no mining cycle for 5+ minutes shows no ETA.
 
+## Where the fill percentage is shown
+
+- Each character row in the window: the percent chip, the colored bar, and
+  the ~m³ / capacity numbers.
+- The tray icon: a donut gauge of the fullest character, with the number
+  in the middle. Hover it for a per-character list with ETAs.
+- The taskbar button: the same live gauge is used as the window icon, and
+  the window title reads "Ore Hold Watcher - 64%" (fullest character), so
+  the number shows in the taskbar hover and in Alt-Tab.
+- Alerts: every digest lists all characters with percent, volume, and ETA.
+
+Colors everywhere mean the same thing: green below 75%, amber 75 to 90%,
+red above 90%.
+
 ## Alerts
 
 Alerts are fleet digests: one notification listing every character
@@ -99,23 +113,61 @@ Each method is a checkbox on the Alerts tab, saved in `settings.json`:
 - **Sound**: the built-in Windows exclamation ding.
 - **Webhook**: HTTP POST to any URL. Discord webhook URLs are detected
   automatically and get an `@everyone` embed with one color-coded line per
-  character (create one under Server Settings > Integrations > Webhooks).
-  Any other endpoint receives JSON: `title`, `message`, and a `characters`
-  array with `est_m3`, `capacity_m3`, `pct`, and `eta_min` per character.
+  character (see "Creating a Discord webhook" below). Any other endpoint
+  receives JSON: `title`, `message`, and a `characters` array with
+  `est_m3`, `capacity_m3`, `pct`, and `eta_min` per character.
 - **Phone push via ntfy.sh**: install the free ntfy app, subscribe to a
   topic name of your choosing (treat it like a password), and enter the
   same topic in Settings. No account needed. For true SMS you would need a
   paid gateway such as Twilio or your carrier's email-to-SMS bridge; ntfy
   is the free substitute.
 
-## Downtime auto-close (off by default)
+### Creating a Discord webhook
+
+You need a text channel you control on any server. Webhooks cannot post to
+DMs. If you don't have a server yet, make a free private one first: click
+the `+` at the bottom of Discord's server list, pick "Create My Own", then
+"For me and my friends", give it a name, done. That takes about 20
+seconds and nobody else can see it.
+
+Then, on the desktop app or in a browser (the mobile app can't manage
+webhooks):
+
+1. Hover the channel you want alerts in and click the gear (Edit Channel).
+2. Open the "Integrations" tab.
+3. Click "Webhooks", then "New Webhook" (or "Create Webhook" if the list
+   is empty). Discord creates one with a random name.
+4. Click the new webhook to expand it. Name it something like
+   `Ore Watcher` (that name appears as the message author), and confirm
+   the channel dropdown points where you want.
+5. Click "Copy Webhook URL", then "Save Changes" if the bar appears.
+6. In this app: Settings, Alerts tab, tick "Webhook", paste the URL, and
+   click "Send test alert". The fleet digest should land in the channel
+   within a second or two.
+
+Two things to know. First, the alert pings `@everyone` in that channel,
+which on a personal server is just you; if you put it on a shared server,
+pick a channel where the fleet actually wants pings. Second, treat the URL
+like a password: anyone who has it can post to your channel, no login
+needed. If it leaks, delete or regenerate the webhook on the same
+Integrations page and paste the new URL into Settings.
+
+## Downtime auto-close (off by default, NOT yet tested in the wild)
+
+**Warning: this feature has not been tested against real running EVE
+clients.** The scheduling logic passes unit tests, but the actual
+force-close has only been exercised with mocked processes. Try it on a day
+when losing an unsaved client state wouldn't hurt, and confirm the kill
+works on your setup before relying on it.
 
 On the Downtime tab, tick "Force-close all EVE clients before daily
 downtime" and set the lead time (default 5 minutes). That many minutes
 before the 11:00 UTC cluster shutdown, the app runs
-`taskkill /F /IM exefile.exe` (process names are configurable via
-`eve_process_names` in settings.json), then sends an alert saying how many
-clients it closed. It fires once per day and only while the app is
+`taskkill /F /T /IM exefile.exe`, the same command the community has long
+used in a Windows scheduled task for this purpose (`/T` also kills child
+processes). Process names are configurable via `eve_process_names` in
+settings.json. Afterward it sends an alert saying how many clients it
+closed. It fires once per day and only while the app is
 running. Force-kill skips the graceful logout, so ships get EVE's normal
 emergency-warp handling, which is the point of doing it before shutdown.
 
