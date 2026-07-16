@@ -36,6 +36,12 @@ shortcut to `OreHoldWatcher.exe` (or `run.bat`) in that folder.
   after an op. You can also right-click → **Set current m³…** to calibrate
   to what the client shows, and **Set capacity…** per character (default
   180,000 m³, changeable in Settings).
+- The **Recalculate** button (window and tray) rebuilds every estimate
+  purely from the logs: anchors are dropped and the whole lookback window is
+  replayed — compressions act as natural zero-points, so this lands on
+  reality for a compress-and-move workflow. The tray also keeps a
+  "Reset all holds to 0" for after a full unload, and per-character
+  right-click → Reset still means "this hold was emptied".
 - **Restarts recalculate, never double-count.** Only your reset/calibration
   anchor (timestamp + m³) is saved; on every launch the estimate is rebuilt
   by replaying log events newer than the anchor. Closing and reopening the
@@ -55,6 +61,10 @@ shortcut to `OreHoldWatcher.exe` (or `run.bat`) in that folder.
   100% and alerts immediately, regardless of the estimate.
 - Alerts fire once per crossing and re-arm after a reset or when the fill
   drops 5% below the threshold.
+- **Time-to-full estimates:** each actively-mining character's row shows
+  "⏳ 2h 14m" based on their mining rate over the last 10 minutes, and the
+  status line (plus tray tooltip) shows which hold fills first fleet-wide.
+  A pilot with no mining cycle for 5+ minutes shows no ETA.
 
 ## Alert methods
 
@@ -113,15 +123,32 @@ APPDATA. All of these are in `.gitignore`:
 - `ores_override.json` — optional; add `{"Some Ore Name": 5.0}` entries
   (m³ per unit) if the app ever reports an unknown ore.
 
+## CI / Releases (GitHub)
+
+Push the folder to a GitHub repo and two workflows take over:
+
+- **CI** (`.github/workflows/ci.yml`) — every push/PR runs the engine tests
+  on Linux, then builds the Windows exe with Nuitka and uploads it as a
+  build artifact (Actions tab → run → Artifacts).
+- **Release** (`.github/workflows/release.yml`) — pushing a version tag
+  builds a version-stamped exe and publishes a GitHub Release with
+  `OreHoldWatcher.exe` attached and auto-generated notes:
+
+      git tag v1.0.0
+      git push origin v1.0.0
+
+Both are fully non-interactive (as is `build.bat` locally); the first CI
+build takes a while, later ones reuse the Nuitka compilation cache.
+
 ## Debugging
 
-`%APPDATA%\OreHoldWatcher\debug.log` records the watched folder, every log
-file picked up (with its Listener/character), compressions, warnings for
-unknown ores, and — most importantly — any `(mining)` lines the parser
-didn't recognize. Open it from the tray menu (Open debug log) or Settings.
-Tick "Verbose debug logging" in Settings to also log every mining cycle.
-The window's status line always shows the watched folder plus live
-file/line/event counters.
+Tick "Debug logging" in Settings to write `debug.log` (beside the exe):
+the watched folder, every log file picked up (with its Listener/character),
+compressions, unknown-ore warnings, every mining cycle, and — most
+importantly — any `(mining)` lines the parser didn't recognize. Open it
+from the tray menu or Settings. **When unticked (default) no log file is
+written at all.** The window's status line always shows the watched folder
+plus live file/line/event counters either way.
 
 The Gamelogs folder is auto-detected for the active user via the Windows
 known-folder API (which follows OneDrive-redirected Documents), the

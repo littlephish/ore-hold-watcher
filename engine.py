@@ -16,11 +16,13 @@ user (when they unload) or calibrated to a known m3 value.
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import os
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -73,6 +75,18 @@ def now_ts() -> str:
     """Current time in EVE log-timestamp format (EVE time == UTC).
     The zero-padded format compares correctly as a plain string."""
     return time.strftime("%Y.%m.%d %H:%M:%S", time.gmtime())
+
+
+def ts_to_epoch(ts: str) -> float:
+    """Log timestamp ('2026.07.16 11:15:33', UTC) -> unix epoch."""
+    try:
+        return calendar.timegm(time.strptime(ts, "%Y.%m.%d %H:%M:%S"))
+    except ValueError:
+        return 0.0
+
+
+RATE_WINDOW_S = 600   # mining rate = volume over the last 10 minutes
+RATE_IDLE_S = 300     # no cycle for 5 min -> treat as not mining (no ETA)
 
 
 HOLD_FULL_MARKERS = (
@@ -252,6 +266,32 @@ class CharacterState:
     # by replaying the logs, so restarts never double-count.
     anchor_ts: str = ""              # "YYYY.MM.DD HH:MM:SS" (log format, UTC)
     anchor_m3: float = 0.0
+    # rolling (epoch, m3) mining events for rate/ETA; not persisted
+    rate_events: deque = field(default_factory=deque)
+
+    def mining_rate_m3_min(self, now_epoch: float | None = None) -> float:
+        """Current mining speed in m3/min over the rolling window;
+        0 when idle for RATE_IDLE_S or no data."""
+        if not self.rate_events:
+            return 0.0
+        now_epoch = now_epoch if now_epoch is not None else time.time()
+        newest = self.rate_events[-1][0]
+        if now_epoch - newest > RATE_IDLE_S:
+            return 0.0
+        oldest = self.rate_events[0][0]
+        span = max(60.0, newest - oldest)   # floor: one cycle ≠ infinite rate
+        total = sum(m for _, m in self.rate_events)
+        return total / (span / 60.0)
+
+    def eta_full_s(self, now_epoch: float | None = None) -> float | None:
+        """Seconds until this hold hits capacity at the current rate;
+        None when not actively mining, 0 when already full."""
+        if self.est_m3 >= self.capacity:
+            return 0.0
+        rate = self.mining_rate_m3_min(now_epoch)
+        if rate <= 0:
+            return None
+        return (self.capacity - self.est_m3) / rate * 60.0
 
     @property
     def pct(self) -> float:
@@ -349,6 +389,22 @@ class Engine:
             c.notified = False
         self.save_state()
 
+    def recalculate(self):
+        """Rebuild every estimate from the logs alone: drop all anchors and
+        replay the whole lookback window from the top of each file."""
+        log.info("recalculating all characters from logs")
+        for c in self.chars.values():
+            c.est_m3 = 0.0
+            c.anchor_ts = ""
+            c.anchor_m3 = 0.0
+            c.notified = False
+            c.rate_events.clear()  # replay refills these; keeping them would
+                                   # double-count the rate and wreck the ETA
+        self.files.clear()      # forget offsets -> re-read from byte 0
+        self._last_scan = 0.0   # force immediate rediscovery
+        self.save_state()
+        return self.poll()      # replay now so the UI updates immediately
+
     def calibrate(self, name: str, m3: float):
         c = self.char(name)
         c.est_m3 = max(0.0, float(m3))
@@ -432,6 +488,12 @@ class Engine:
                     c = self.char(ev.character)
                     c.est_m3 += ev.m3
                     c.last_event = now
+                    ep = ts_to_epoch(ev.ts)
+                    if ep:
+                        c.rate_events.append((ep, ev.m3))
+                        while (c.rate_events and
+                               ep - c.rate_events[0][0] > RATE_WINDOW_S):
+                            c.rate_events.popleft()
                     dirty = True
                 elif isinstance(ev, HoldFullEvent):
                     c = self.char(ev.character)

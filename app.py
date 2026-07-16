@@ -102,19 +102,36 @@ def config_dir() -> Path:
     return d
 
 
+_LOG_FMT = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+_FILE_HANDLER: logging.Handler | None = None
+
+
+def set_file_logging(enabled: bool):
+    """Attach/detach the debug.log file handler. When debug logging is
+    disabled, nothing is written to disk at all."""
+    global _FILE_HANDLER
+    root = logging.getLogger("orewatcher")
+    if enabled and _FILE_HANDLER is None:
+        fh = logging.handlers.RotatingFileHandler(
+            config_dir() / "debug.log", maxBytes=1_000_000, backupCount=3,
+            encoding="utf-8")
+        fh.setFormatter(_LOG_FMT)
+        root.addHandler(fh)
+        _FILE_HANDLER = fh
+    elif not enabled and _FILE_HANDLER is not None:
+        root.removeHandler(_FILE_HANDLER)
+        _FILE_HANDLER.close()
+        _FILE_HANDLER = None
+
+
 def setup_logging(verbose: bool):
-    """Log to %APPDATA%/OreHoldWatcher/debug.log (rotating) and stderr."""
+    """stderr always; debug.log only while debug logging is enabled."""
     root = logging.getLogger("orewatcher")
     root.setLevel(logging.DEBUG if verbose else logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
-    fh = logging.handlers.RotatingFileHandler(
-        config_dir() / "debug.log", maxBytes=1_000_000, backupCount=3,
-        encoding="utf-8")
-    fh.setFormatter(fmt)
-    root.addHandler(fh)
     sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
+    sh.setFormatter(_LOG_FMT)
     root.addHandler(sh)
+    set_file_logging(verbose)
 
 
 def _documents_candidates() -> list[Path]:
@@ -247,11 +264,70 @@ QLineEdit, QDoubleSpinBox, QSpinBox {
 }
 QLineEdit::placeholder { color: #6d6f78; }
 QCheckBox { spacing: 8px; }
+QTabWidget::pane { border: 1px solid #1e1f22; border-radius: 4px; }
+QTabBar::tab {
+    background: #2b2d31; color: #949ba4; padding: 6px 14px;
+    border-top-left-radius: 4px; border-top-right-radius: 4px;
+}
+QTabBar::tab:selected { background: #404249; color: #ffffff; }
+QTreeWidget {
+    background: #1e1f22; alternate-background-color: #232428;
+    border: 1px solid #1e1f22; border-radius: 4px;
+}
+QTreeWidget::item { padding: 3px 6px; }
+QTreeWidget::item:selected { background: #5865f2; color: #ffffff; }
+QHeaderView::section {
+    background: #2b2d31; color: #949ba4; border: none;
+    padding: 4px 6px; font-weight: 700;
+}
 QPushButton:hover { background: #6d6f78; }
 QScrollArea { border: none; }
 QMenu { background: #2b2d31; border: 1px solid #1e1f22; }
 QMenu::item:selected { background: #404249; }
 """
+
+
+def style_titlebar(win):
+    """Match the native Windows title bar to the app's dark theme.
+    Win11: exact caption/text colors; Win10 (1809+): dark mode fallback."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        hwnd = int(win.winId())
+        dwm = ctypes.windll.dwmapi
+        dark = ctypes.c_int(1)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (20; 19 pre-20H1)
+            if dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(dark), 4) == 0:
+                break
+        # Win11 22000+: precise colors (harmlessly rejected on Win10)
+        caption = ctypes.c_uint(0x00312D2B)  # #2b2d31 as COLORREF (BGR)
+        text = ctypes.c_uint(0x00E1DEDB)     # #dbdee1
+        dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(caption), 4)
+        dwm.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(text), 4)
+    except Exception:
+        pass
+
+
+class DarkDialog(QDialog):
+    """QDialog with the themed native title bar."""
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        style_titlebar(self)
+
+
+def fmt_eta(seconds: float) -> str:
+    s = int(seconds)
+    if s <= 0:
+        return "FULL"
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    if h:
+        return f"{h}h {m:02d}m"
+    if m:
+        return f"{m}m"
+    return "<1m"
 
 
 def fill_color(pct: float) -> str:
@@ -397,8 +473,15 @@ class Notifier:
         if chars:
             def dot(p):
                 return "🔴" if p >= 90 else ("🟡" if p >= 75 else "🟢")
+            def eta_txt(c):
+                m = c.get("eta_min")
+                if m is None:
+                    return ""
+                if m <= 0:
+                    return " · **FULL**"
+                return f" · full in {m//60}h {m%60:02d}m" if m >= 60 else f" · full in {m}m"
             lines = [f"{dot(c['pct'])} `{c['pct']:5.1f}%` **{c['character']}** — "
-                     f"~{c['est_m3']:,} / {c['capacity_m3']:,} m³"
+                     f"~{c['est_m3']:,} / {c['capacity_m3']:,} m³{eta_txt(c)}"
                      for c in chars]
             desc = "\n".join(lines)
             max_pct = max(c["pct"] for c in chars)
@@ -464,12 +547,15 @@ class CharRow(QWidget):
         lay.addLayout(top)
         lay.addWidget(self.bar)
 
-    def update_state(self, est: float, cap: float):
+    def update_state(self, est: float, cap: float, eta_s: float | None = None):
         pct = 100.0 * est / cap if cap else 0.0
         col = fill_color(pct)
         self.dot.setStyleSheet(f"color: {col}; font-size: 14px;")
         self.chip.setText(f"{pct:.1f}%")
-        self.amount.setText(f"~{est:,.0f} / {cap:,.0f} m³")
+        txt = f"~{est:,.0f} / {cap:,.0f} m³"
+        if eta_s is not None:
+            txt += f"  ·  ⏳ {fmt_eta(eta_s)}"
+        self.amount.setText(txt)
         self.bar.setValue(int(min(pct, 100) * 10))
         self.bar.setStyleSheet(
             f"QProgressBar::chunk {{ background: {col}; border-radius: 4px; }}")
@@ -488,7 +574,80 @@ class CharRow(QWidget):
 # Settings dialog
 # ---------------------------------------------------------------------------
 
-class SettingsDialog(QDialog):
+# (ship, base ore hold m3, ore hold at relevant skill V, bonus skill)
+# Sources: EVE University wiki, July 2026. Retriever/Mackinaw holds grow
+# +5%/level of Mining Barge; Porpoise/Orca +5%/level of Industrial Command
+# Ships; Rorqual +5%/level of Capital Industrial Ships. Others are fixed.
+SHIP_ORE_HOLDS = [
+    ("Venture",   5000,   5000,  ""),
+    ("Covetor",   9000,   9000,  ""),
+    ("Hulk",      11500,  11500, ""),
+    ("Prospect",  12500,  12500, ""),
+    ("Procurer",  16000,  16000, ""),
+    ("Skiff",     18500,  18500, ""),
+    ("Endurance", 19000,  19000, ""),
+    ("Retriever", 27500,  34375, "Mining Barge V"),
+    ("Mackinaw",  28000,  35000, "Mining Barge V"),
+    ("Porpoise",  50000,  62500, "Industrial Command Ships V"),
+    ("Orca",      150000, 187500, "Industrial Command Ships V"),
+    ("Rorqual",   300000, 375000, "Capital Industrial Ships V"),
+]
+
+
+class OreHoldInfoDialog(DarkDialog):
+    """Reference table of standard ore hold sizes; pick one to use it."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Standard ore hold sizes")
+        self.chosen: float | None = None
+        from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["Ship", "Base m³", "Max-skill m³"])
+        self.tree.setRootIsDecorated(False)
+        orca_item = None
+        for ship, base, at_v, skill in SHIP_ORE_HOLDS:
+            it = QTreeWidgetItem([ship, f"{base:,}", f"{at_v:,}"])
+            if skill:
+                it.setToolTip(2, f"with {skill}")
+            self.tree.addTopLevelItem(it)
+            if ship == "Orca":
+                orca_item = it
+        for col in range(3):
+            self.tree.resizeColumnToContents(col)
+        if orca_item:
+            self.tree.setCurrentItem(orca_item)  # Orca is the default pick
+        self.tree.itemDoubleClicked.connect(lambda *_: self.use_selected())
+
+        note = QLabel("Hold sizes grow +5%/level from Mining Barge "
+                      "(Retriever, Mackinaw), Industrial Command Ships "
+                      "(Porpoise, Orca) or Capital Industrial Ships "
+                      "(Rorqual). Max-skill column assumes level V — an "
+                      "Orca at ICS IV is 180,000 m³.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #949ba4;")
+
+        bb = QDialogButtonBox(QDialogButtonBox.Cancel)
+        use = bb.addButton("Use max-skill size", QDialogButtonBox.AcceptRole)
+        use_base = bb.addButton("Use base size", QDialogButtonBox.ActionRole)
+        bb.rejected.connect(self.reject)
+        use.clicked.connect(self.use_selected)
+        use_base.clicked.connect(lambda: self.use_selected(base=True))
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.tree, 1)
+        lay.addWidget(note)
+        lay.addWidget(bb)
+        self.resize(430, 420)
+
+    def use_selected(self, base: bool = False):
+        it = self.tree.currentItem()
+        if it:
+            self.chosen = float(it.text(1 if base else 2).replace(",", ""))
+            self.accept()
+
+class SettingsDialog(DarkDialog):
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
@@ -513,6 +672,13 @@ class SettingsDialog(QDialog):
         self.capacity.setDecimals(0)
         self.capacity.setSuffix(" m³")
         self.capacity.setValue(float(settings["default_capacity"]))
+        cap_info = QPushButton("ℹ")
+        cap_info.setFixedWidth(30)
+        cap_info.setToolTip("Standard ore hold sizes per ship")
+        cap_info.clicked.connect(self.show_hold_sizes)
+        cap_row = QHBoxLayout()
+        cap_row.addWidget(self.capacity)
+        cap_row.addWidget(cap_info)
 
         # alert methods
         self.interval = QDoubleSpinBox()
@@ -525,7 +691,7 @@ class SettingsDialog(QDialog):
 
         self.m_popup = QCheckBox("Pop-up notification (Windows toast)")
         self.m_popup.setChecked(bool(settings["notify_popup"]))
-        self.m_overlay = QCheckBox("On-screen overlay banner (always on top)")
+        self.m_overlay = QCheckBox("On-screen overlay banner alert")
         self.m_overlay.setChecked(bool(settings["notify_overlay"]))
         self.m_sound = QCheckBox("Sound (system ding)")
         self.m_sound.setChecked(bool(settings["notify_sound"]))
@@ -549,48 +715,73 @@ class SettingsDialog(QDialog):
         self.dt_lead.setSuffix(" min before")
         self.dt_lead.setValue(float(settings["close_minutes_before"]))
 
-        self.ontop = QCheckBox("Window always on top")
+        self.ontop = QCheckBox("Keep main window always on top of other windows")
         self.ontop.setChecked(bool(settings["always_on_top"]))
         self.comp_out = QCheckBox("Compressed ore is moved out of the ore hold\n"
                                   "(compression frees the full raw volume)")
         self.comp_out.setChecked(bool(settings["compressed_leaves_hold"]))
-        self.dbg = QCheckBox("Verbose debug logging (every mining cycle)")
+        self.dbg = QCheckBox("Debug logging to debug.log (verbose; off = "
+                             "no log file is written)")
         self.dbg.setChecked(bool(settings["debug_verbose"]))
         self.open_log = QPushButton("Open debug log")
         self.open_log.clicked.connect(
             lambda: os.startfile(config_dir() / "debug.log")
-            if sys.platform == "win32" else None)
+            if sys.platform == "win32" and (config_dir() / "debug.log").exists()
+            else None)
 
-        form = QFormLayout(self)
-        form.addRow("Gamelogs folder:", row)
-        form.addRow("Alert threshold:", self.threshold)
-        form.addRow("Default ore hold capacity:", self.capacity)
-        lab = QLabel("Alert methods (at threshold):")
-        lab.setStyleSheet("font-weight: 700; margin-top: 8px;")
-        form.addRow(lab)
-        form.addRow("Min. time between alerts:", self.interval)
-        form.addRow(self.m_popup)
-        form.addRow(self.m_overlay)
-        form.addRow(self.m_sound)
-        form.addRow(self.m_webhook)
-        form.addRow("Webhook URL:", self.webhook_url)
-        form.addRow(self.m_ntfy)
-        form.addRow("ntfy topic:", self.ntfy_topic)
-        form.addRow(self.test_btn)
-        lab2 = QLabel("Downtime:")
-        lab2.setStyleSheet("font-weight: 700; margin-top: 8px;")
-        form.addRow(lab2)
-        form.addRow(self.dt_close)
-        form.addRow("Close clients:", self.dt_lead)
-        form.addRow(self.ontop)
-        form.addRow(self.comp_out)
-        form.addRow(self.dbg)
-        form.addRow(self.open_log)
+        from PySide6.QtWidgets import QTabWidget
+        tabs = QTabWidget()
+
+        gen = QWidget()
+        gf = QFormLayout(gen)
+        gf.addRow("Gamelogs folder:", row)
+        gf.addRow("Alert threshold:", self.threshold)
+        gf.addRow("Default ore hold capacity:", cap_row)
+        gf.addRow(self.ontop)
+        gf.addRow(self.comp_out)
+        gf.addRow(self.dbg)
+        gf.addRow(self.open_log)
+        tabs.addTab(gen, "General")
+
+        al = QWidget()
+        af = QFormLayout(al)
+        af.addRow("Min. time between alerts:", self.interval)
+        af.addRow(self.m_popup)
+        af.addRow(self.m_overlay)
+        af.addRow(self.m_sound)
+        af.addRow(self.m_webhook)
+        af.addRow("Webhook URL:", self.webhook_url)
+        af.addRow(self.m_ntfy)
+        af.addRow("ntfy topic:", self.ntfy_topic)
+        af.addRow(self.test_btn)
+        tabs.addTab(al, "Alerts")
+
+        dt = QWidget()
+        df = QFormLayout(dt)
+        df.addRow(self.dt_close)
+        df.addRow("Close clients:", self.dt_lead)
+        note = QLabel("EVE's daily cluster shutdown is 11:00 UTC. When "
+                      "enabled, all EVE client processes are force-closed "
+                      "this many minutes beforehand (once per day, only "
+                      "while this app is running).")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #949ba4;")
+        df.addRow(note)
+        tabs.addTab(dt, "Downtime")
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
-        form.addRow(bb)
+
+        root = QVBoxLayout(self)
+        root.addWidget(tabs)
+        root.addWidget(bb)
+        self.setMinimumWidth(520)
+
+    def show_hold_sizes(self):
+        dlg = OreHoldInfoDialog(self)
+        if dlg.exec() == QDialog.Accepted and dlg.chosen:
+            self.capacity.setValue(dlg.chosen)
 
     def pick_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Select Gamelogs folder",
@@ -617,7 +808,14 @@ class SettingsDialog(QDialog):
         self.s["debug_verbose"] = self.dbg.isChecked()
         logging.getLogger("orewatcher").setLevel(
             logging.DEBUG if self.dbg.isChecked() else logging.INFO)
+        set_file_logging(self.dbg.isChecked())
         self.s.save()
+        log.info("settings saved to %s: always_on_top=%s overlay=%s popup=%s "
+                 "sound=%s webhook=%s ntfy=%s interval=%.1fmin",
+                 self.s.path, self.s["always_on_top"], self.s["notify_overlay"],
+                 self.s["notify_popup"], self.s["notify_sound"],
+                 self.s["notify_webhook"], self.s["notify_ntfy"],
+                 float(self.s["alert_interval_min"]))
 
 
 # ---------------------------------------------------------------------------
@@ -668,8 +866,10 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 15px; font-weight: 700;")
         hdr.addWidget(title)
         hdr.addStretch(1)
-        b_reset = QPushButton("Reset all")
-        b_reset.clicked.connect(self.reset_all)
+        b_reset = QPushButton("Recalculate")
+        b_reset.setToolTip("Rebuild all estimates by replaying the logs "
+                           "(last %d h)" % int(float(self.settings["lookback_hours"])))
+        b_reset.clicked.connect(self.recalculate)
         b_cfg = QPushButton("⚙")
         b_cfg.setFixedWidth(34)
         b_cfg.clicked.connect(self.open_settings)
@@ -701,11 +901,13 @@ class MainWindow(QMainWindow):
         self.tray.setToolTip(APP_NAME)
         menu = QMenu()
         menu.addAction("Show / Hide", self.toggle_visible)
-        menu.addAction("Reset all holds", self.reset_all)
+        menu.addAction("Recalculate from logs", self.recalculate)
+        menu.addAction("Reset all holds to 0", self.reset_all)
         menu.addSeparator()
         if sys.platform == "win32":
             menu.addAction("Open debug log",
-                           lambda: os.startfile(config_dir() / "debug.log"))
+                           lambda: os.startfile(config_dir() / "debug.log")
+                           if (config_dir() / "debug.log").exists() else None)
         menu.addAction("Quit", self.quit)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(
@@ -724,12 +926,33 @@ class MainWindow(QMainWindow):
 
     # -- helpers -------------------------------------------------------------
     def apply_on_top(self):
-        flags = self.windowFlags()
-        if self.settings["always_on_top"]:
-            flags |= Qt.WindowStaysOnTopHint
-        else:
-            flags &= ~Qt.WindowStaysOnTopHint
-        self.setWindowFlags(flags)
+        want = bool(self.settings["always_on_top"])
+        if bool(self.windowFlags() & Qt.WindowStaysOnTopHint) != want:
+            was_visible = self.isVisible()
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, want)
+            if was_visible:
+                self.show()  # setWindowFlag hides the window; re-show it
+        # belt & braces: force the native WS_EX_TOPMOST bit to match, in
+        # case anything else (or a stale flag) left the window pinned
+        if self.isVisible() and sys.platform == "win32":
+            try:
+                import ctypes
+                HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+                SWP_NOMOVE_NOSIZE_NOACTIVATE = 0x0002 | 0x0001 | 0x0010
+                ctypes.windll.user32.SetWindowPos(
+                    int(self.winId()),
+                    HWND_TOPMOST if want else HWND_NOTOPMOST,
+                    0, 0, 0, 0, SWP_NOMOVE_NOSIZE_NOACTIVATE)
+            except Exception as e:
+                log.warning("native topmost enforce failed: %s", e)
+        log.info("always_on_top=%s (qt flag=%s)", want,
+                 bool(self.windowFlags() & Qt.WindowStaysOnTopHint))
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        style_titlebar(self)
+        # re-assert whenever the window (re)appears, e.g. from the tray
+        QTimer.singleShot(0, self.apply_on_top)
 
     def toggle_visible(self):
         if self.isVisible():
@@ -759,13 +982,18 @@ class MainWindow(QMainWindow):
         """All characters' current state, fullest first."""
         chars = sorted(self.engine.chars.values(),
                        key=lambda c: c.pct, reverse=True)
-        lines = [f"{c.name} — ~{c.est_m3:,.0f} / {c.capacity:,.0f} m³ "
-                 f"({c.pct:.1f}%)" for c in chars]
-        payload = {"characters": [
-            {"character": c.name, "est_m3": round(c.est_m3),
-             "capacity_m3": round(c.capacity), "pct": round(c.pct, 1)}
-            for c in chars]}
-        return "\n".join(lines) or "No characters tracked yet.", payload
+        lines, payload_chars = [], []
+        for c in chars:
+            eta = c.eta_full_s()
+            eta_txt = f" · full in {fmt_eta(eta)}" if eta else ""
+            lines.append(f"{c.name} — ~{c.est_m3:,.0f} / {c.capacity:,.0f} m³ "
+                         f"({c.pct:.1f}%){eta_txt}")
+            payload_chars.append(
+                {"character": c.name, "est_m3": round(c.est_m3),
+                 "capacity_m3": round(c.capacity), "pct": round(c.pct, 1),
+                 "eta_min": round(eta / 60) if eta is not None else None})
+        return ("\n".join(lines) or "No characters tracked yet.",
+                {"characters": payload_chars})
 
     def request_alert(self, title: str):
         """Queue a threshold alert; sent as a full-fleet digest, at most one
@@ -842,6 +1070,10 @@ class MainWindow(QMainWindow):
     # -- actions ---------------------------------------------------------------
     def reset_all(self):
         self.engine.reset_all()
+        self.refresh()
+
+    def recalculate(self):
+        self.engine.recalculate()
         self.refresh()
 
     def reset_char(self, name: str):
@@ -945,11 +1177,20 @@ class MainWindow(QMainWindow):
             frame, row = self.rows[c.name]
             self.rows_box.removeWidget(frame)
             self.rows_box.insertWidget(i, frame)
-            row.update_state(c.est_m3, c.capacity)
+            row.update_state(c.est_m3, c.capacity, c.eta_full_s())
+
+        # who fills up first at current mining rates?
+        etas = [(c.eta_full_s(), c) for c in chars]
+        etas = [(e, c) for e, c in etas if e is not None and e > 0]
+        first_full = min(etas, key=lambda t: t[0]) if etas else None
 
         s = self.engine.stats
         dir_ok = self.engine.log_dir.is_dir()
-        parts = [f"{'Watching' if dir_ok else '⚠ MISSING FOLDER'}: "
+        parts = []
+        if first_full:
+            parts.append(f"⏳ First hold full: {first_full[1].name} in "
+                         f"~{fmt_eta(first_full[0])}")
+        parts += [f"{'Watching' if dir_ok else '⚠ MISSING FOLDER'}: "
                  f"{self.engine.log_dir}",
                  f"{len(self.engine.files)} log files · "
                  f"{s['lines']:,} lines · {s['mining_events']:,} mining · "
@@ -967,7 +1208,11 @@ class MainWindow(QMainWindow):
 
         max_pct = max((c.pct for c in chars), default=0.0)
         self.tray.setIcon(make_tray_icon(max_pct))
-        tip = "\n".join(f"{c.pct:.1f}%  {c.name}" for c in chars[:8]) or APP_NAME
+        def tip_line(c):
+            eta = c.eta_full_s()
+            return (f"{c.pct:.1f}%  {c.name}" +
+                    (f"  ({fmt_eta(eta)})" if eta else ""))
+        tip = "\n".join(tip_line(c) for c in chars[:8]) or APP_NAME
         self.tray.setToolTip(tip)
 
 
@@ -980,6 +1225,7 @@ def main():
     setup_logging(verbose)
     log.info("=== Ore Hold Watcher starting (user=%s) ===", os.environ.get(
         "USERNAME") or os.environ.get("USER") or "?")
+    log.info("config dir: %s", config_dir())
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(APP_NAME)

@@ -10,6 +10,7 @@ if not exist .venv (
 
 .venv\Scripts\python -m nuitka ^
     --onefile ^
+    --assume-yes-for-downloads ^
     --enable-plugin=pyside6 ^
     --windows-console-mode=disable ^
     --windows-icon-from-ico=icon.ico ^
@@ -22,4 +23,3 @@ if not exist .venv (
 
 echo.
 echo Done. Exe: build\OreHoldWatcher.exe
-pause

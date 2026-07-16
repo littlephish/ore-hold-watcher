@@ -1,0 +1,72 @@
+name: Release
+
+# Tag a commit and push it to publish a release with the exe attached:
+#   git tag v1.0.0
+#   git push origin v1.0.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+jobs:
+  test:
+    name: Engine tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python test_engine.py
+
+  release:
+    name: Build & publish exe
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt nuitka
+
+      - name: Cache Nuitka compilation cache
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\Nuitka\Nuitka\Cache
+          key: nuitka-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: nuitka-${{ runner.os }}-
+
+      - name: Build (version-stamped from tag)
+        shell: pwsh
+        run: |
+          # "v1.2.3" -> "1.2.3"; Windows version resources want x.y.z[.w]
+          $ver = "${{ github.ref_name }}".TrimStart("v")
+          if ($ver -notmatch '^\d+(\.\d+){1,3}$') { $ver = "0.0.0" }
+          python -m nuitka `
+            --onefile `
+            --assume-yes-for-downloads `
+            --enable-plugin=pyside6 `
+            --windows-console-mode=disable `
+            --windows-icon-from-ico=icon.ico `
+            --company-name="Jared" `
+            --product-name="Ore Hold Watcher" `
+            --file-version="$ver" `
+            --product-version="$ver" `
+            --output-filename=OreHoldWatcher.exe `
+            --output-dir=build `
+            app.py
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Ore Hold Watcher ${{ github.ref_name }}
+          generate_release_notes: true
+          files: build/OreHoldWatcher.exe
+          fail_on_unmatched_files: true
