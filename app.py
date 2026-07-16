@@ -1,0 +1,993 @@
+"""Ore Hold Watcher — local EVE Online ore hold tracker.
+
+Sits in the system tray, tails your EVE gamelogs, estimates each character's
+ore hold fill, and pops a Windows notification when a hold crosses the alert
+threshold. No Discord, no ESI, fully local.
+
+Run:      pythonw app.py         (or use run.bat)
+Package:  build.bat              (Nuitka onefile exe)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import logging.handlers
+import os
+import sys
+import threading
+import time
+import urllib.request
+from pathlib import Path
+
+log = logging.getLogger("orewatcher.app")
+
+from PySide6.QtCore import Qt, QTimer, QSize
+from PySide6.QtGui import (QAction, QBrush, QColor, QIcon, QPainter, QPen,
+                           QPixmap, QFont)
+from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox,
+                               QDoubleSpinBox, QFileDialog, QFormLayout,
+                               QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+                               QMainWindow, QMenu, QMessageBox, QProgressBar,
+                               QPushButton, QScrollArea, QSpinBox,
+                               QSystemTrayIcon, QVBoxLayout, QWidget,
+                               QCheckBox)
+
+from engine import Engine, MiningEvent, HoldFullEvent, UnknownOreEvent
+
+APP_NAME = "Ore Hold Watcher"
+ORG_DIR = "OreHoldWatcher"
+
+try:
+    from winotify import Notification, audio  # Windows toasts
+    HAVE_WINOTIFY = sys.platform == "win32"
+except Exception:
+    HAVE_WINOTIFY = False
+
+
+def _appdata_dir() -> Path:
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", Path.home()))
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / ORG_DIR
+
+
+def app_base_dir() -> Path:
+    """Folder the exe lives in (Nuitka/frozen) or the source folder."""
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent
+
+
+def _writable(d: Path) -> bool:
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        probe = d / ".write_test"
+        probe.write_text("x", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+_CONFIG_DIR: Path | None = None
+_CONFIG_FILES = ("settings.json", "state.json", "ores_override.json")
+
+
+def config_dir() -> Path:
+    """Config lives BESIDE THE EXE (portable). Falls back to APPDATA when
+    that folder isn't writable. Existing APPDATA config is migrated (copied)
+    the first time, so nothing is lost."""
+    global _CONFIG_DIR
+    if _CONFIG_DIR is not None:
+        return _CONFIG_DIR
+    portable = app_base_dir()
+    if _writable(portable):
+        d = portable
+        old = _appdata_dir()
+        if old.is_dir() and not (d / "settings.json").exists():
+            import shutil
+            for f in _CONFIG_FILES:
+                src = old / f
+                if src.exists() and not (d / f).exists():
+                    try:
+                        shutil.copy2(src, d / f)
+                    except OSError:
+                        pass
+    else:
+        d = _appdata_dir()
+        d.mkdir(parents=True, exist_ok=True)
+    _CONFIG_DIR = d
+    return d
+
+
+def setup_logging(verbose: bool):
+    """Log to %APPDATA%/OreHoldWatcher/debug.log (rotating) and stderr."""
+    root = logging.getLogger("orewatcher")
+    root.setLevel(logging.DEBUG if verbose else logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    fh = logging.handlers.RotatingFileHandler(
+        config_dir() / "debug.log", maxBytes=1_000_000, backupCount=3,
+        encoding="utf-8")
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+
+
+def _documents_candidates() -> list[Path]:
+    """Possible Documents folders, best first. No vendor paths hardcoded:
+    the Windows known-folder API already follows OneDrive/redirected
+    Documents; the %OneDrive% env var covers odd setups; plain
+    ~/Documents is the final fallback."""
+    cands: list[Path] = []
+    if sys.platform == "win32":
+        try:  # authoritative: SHGetKnownFolderPath(FOLDERID_Documents)
+            import ctypes
+            from ctypes import wintypes
+            # FOLDERID_Documents {FDD39AD0-238F-46AF-ADB4-6C85480369C7}
+            class GUID(ctypes.Structure):
+                _fields_ = [("D1", ctypes.c_uint32), ("D2", ctypes.c_uint16),
+                            ("D3", ctypes.c_uint16), ("D4", ctypes.c_ubyte * 8)]
+            g = GUID(0xFDD39AD0, 0x238F, 0x46AF,
+                     (ctypes.c_ubyte * 8)(0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7))
+            out = ctypes.c_wchar_p()
+            if ctypes.windll.shell32.SHGetKnownFolderPath(
+                    ctypes.byref(g), 0, None, ctypes.byref(out)) == 0:
+                cands.append(Path(out.value))
+                ctypes.windll.ole32.CoTaskMemFree(out)
+        except Exception as e:
+            log.debug("known-folder lookup failed: %s", e)
+        onedrive = os.environ.get("OneDrive")
+        if onedrive:
+            cands.append(Path(onedrive) / "Documents")
+    cands.append(Path.home() / "Documents")
+    return cands
+
+
+def detect_log_dir() -> Path:
+    """First candidate whose EVE/logs/Gamelogs exists; else the default."""
+    seen = set()
+    for docs in _documents_candidates():
+        d = docs / "EVE" / "logs" / "Gamelogs"
+        if str(d) in seen:
+            continue
+        seen.add(str(d))
+        if d.is_dir():
+            log.info("auto-detected gamelogs folder: %s", d)
+            return d
+        log.info("no gamelogs at candidate: %s", d)
+    return Path.home() / "Documents" / "EVE" / "logs" / "Gamelogs"
+
+
+DEFAULT_SETTINGS = {
+    "log_dir": "",   # "" = auto-detect the active user's Documents/EVE/logs/Gamelogs
+    "debug_verbose": False,
+    "threshold_pct": 90.0,
+    "rearm_margin_pct": 5.0,
+    "default_capacity": 180000.0,
+    "poll_seconds": 2,
+    "lookback_hours": 24,
+    "always_on_top": False,
+    "compressed_leaves_hold": True,  # you drag compressed ore to fleet hangar
+    "alert_interval_min": 5.0,  # at most one alert per X minutes (0 = every alert)
+    # --- auto-close before EVE daily downtime (cluster shutdown 11:00 UTC) ---
+    "close_before_downtime": False,       # OFF by default
+    "close_minutes_before": 5.0,          # force-close X min before shutdown
+    "downtime_utc": "11:00",              # daily cluster shutdown, UTC
+    "eve_process_names": ["exefile.exe"],  # EVE client process name(s)
+    # --- alert methods (each independently toggleable) ---
+    "notify_popup": True,      # Windows toast (or tray balloon fallback)
+    "notify_overlay": False,   # always-on-top banner in the screen corner
+    "notify_sound": True,      # built-in system ding
+    "notify_webhook": False,   # HTTP POST (Discord webhook URLs auto-detected)
+    "webhook_url": "",
+    "notify_ntfy": False,      # push to your phone via ntfy.sh
+    "ntfy_topic": "",
+    "hide_idle_hours": 12,   # hide chars with no activity for this long (0 = never hide)
+    "mining_patterns": [],    # optional custom regexes; empty = built-in defaults
+}
+
+
+class Settings:
+    def __init__(self):
+        self.path = config_dir() / "settings.json"
+        self.data = dict(DEFAULT_SETTINGS)
+        if self.path.exists():
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                self.data.update(raw)
+                # migrate pre-methods "notifications" master switch
+                if "notify_popup" not in raw and "notifications" in raw:
+                    self.data["notify_popup"] = bool(raw["notifications"])
+            except Exception:
+                pass
+        else:
+            self.save()
+
+    def save(self):
+        self.path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+
+    def __getitem__(self, k):
+        return self.data.get(k, DEFAULT_SETTINGS.get(k))
+
+    def __setitem__(self, k, v):
+        self.data[k] = v
+
+
+# ---------------------------------------------------------------------------
+# Styling
+# ---------------------------------------------------------------------------
+
+DARK_QSS = """
+QMainWindow, QDialog { background: #2b2d31; }
+QWidget { color: #dbdee1; font-size: 13px; }
+QLabel#charName { font-weight: 600; font-size: 13px; }
+QLabel#amount { color: #949ba4; font-size: 12px; }
+QLabel#pctChip {
+    background: #1e1f22; color: #dbdee1; border-radius: 4px;
+    padding: 1px 6px; font-weight: 700; font-size: 12px;
+}
+QFrame#row { background: #313338; border-radius: 8px; }
+QProgressBar {
+    background: #1e1f22; border: none; border-radius: 4px;
+    height: 8px; text-align: center;
+}
+QProgressBar::chunk { border-radius: 4px; }
+QPushButton {
+    background: #4e5058; border: none; border-radius: 4px;
+    padding: 5px 12px; color: #fff;
+}
+QLineEdit, QDoubleSpinBox, QSpinBox {
+    background: #ffffff; color: #000000;
+    border: 1px solid #1e1f22; border-radius: 4px; padding: 3px 6px;
+    selection-background-color: #5865f2; selection-color: #ffffff;
+}
+QLineEdit::placeholder { color: #6d6f78; }
+QCheckBox { spacing: 8px; }
+QPushButton:hover { background: #6d6f78; }
+QScrollArea { border: none; }
+QMenu { background: #2b2d31; border: 1px solid #1e1f22; }
+QMenu::item:selected { background: #404249; }
+"""
+
+
+def fill_color(pct: float) -> str:
+    if pct >= 90:
+        return "#f23f43"   # red
+    if pct >= 75:
+        return "#f0b232"   # amber
+    return "#23a55a"       # green
+
+
+def make_tray_icon(pct: float) -> QIcon:
+    """Donut gauge colored by the fullest character."""
+    size = 64
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    rect = pm.rect().adjusted(6, 6, -6, -6)
+    p.setPen(QPen(QColor("#3f4147"), 10))
+    p.drawArc(rect, 0, 360 * 16)
+    if pct > 0:
+        p.setPen(QPen(QColor(fill_color(pct)), 10, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(rect, 90 * 16, -int(360 * 16 * min(pct, 100) / 100))
+    p.setPen(QColor("#dbdee1"))
+    f = QFont()
+    f.setPixelSize(22)
+    f.setBold(True)
+    p.setFont(f)
+    p.drawText(pm.rect(), Qt.AlignCenter, f"{int(round(min(pct, 99)))}")
+    p.end()
+    return QIcon(pm)
+
+
+# ---------------------------------------------------------------------------
+# Alerting
+# ---------------------------------------------------------------------------
+
+class OverlayBanner(QWidget):
+    """Frameless always-on-top banner in the top-right screen corner."""
+
+    def __init__(self):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+                         | Qt.Tool)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.label = QLabel("", self)
+        self.label.setWordWrap(True)
+        self.label.setStyleSheet(
+            "background: #f23f43; color: white; font-size: 16px; "
+            "font-weight: 700; border-radius: 10px; padding: 16px 22px;")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.label)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.hide)
+
+    def mousePressEvent(self, ev):  # click to dismiss
+        self.hide()
+
+    def show_alert(self, text: str, msec: int = 10000):
+        self.label.setText(text)
+        self.adjustSize()
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.move(screen.right() - self.width() - 24, screen.top() + 24)
+        self.show()
+        self.raise_()
+        self._timer.start(msec)
+
+
+def _post_json(url: str, payload: dict, timeout: float = 10.0):
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json",
+                                 "User-Agent": APP_NAME})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status
+
+
+class Notifier:
+    """Fans one alert out to every enabled method. Network sends run in
+    daemon threads so the UI never blocks; failures only hit debug.log."""
+
+    def __init__(self, settings: Settings, tray: QSystemTrayIcon):
+        self.s = settings
+        self.tray = tray
+        self.overlay = OverlayBanner()
+
+    def alert(self, title: str, body: str, payload: dict | None = None):
+        log.info("ALERT: %s | %s", title, body)
+        if self.s["notify_popup"]:
+            self._popup(title, body)
+        if self.s["notify_overlay"]:
+            self.overlay.show_alert(f"{title}\n{body}")
+        if self.s["notify_sound"]:
+            self._ding()
+        if self.s["notify_webhook"] and str(self.s["webhook_url"]).strip():
+            threading.Thread(target=self._webhook,
+                             args=(title, body, payload or {}),
+                             daemon=True).start()
+        if self.s["notify_ntfy"] and str(self.s["ntfy_topic"]).strip():
+            threading.Thread(target=self._ntfy, args=(title, body),
+                             daemon=True).start()
+
+    # -- methods -------------------------------------------------------------
+    def _popup(self, title: str, body: str):
+        if HAVE_WINOTIFY:
+            try:
+                t = Notification(app_id=APP_NAME, title=title, msg=body)
+                t.show()
+                return
+            except Exception as e:
+                log.warning("toast failed: %s", e)
+        self.tray.showMessage(title, body, QSystemTrayIcon.Warning, 8000)
+
+    def _ding(self):
+        try:
+            if sys.platform == "win32":
+                import winsound
+                winsound.PlaySound("SystemExclamation",
+                                   winsound.SND_ALIAS | winsound.SND_ASYNC)
+                return
+        except Exception as e:
+            log.warning("sound failed: %s", e)
+        QApplication.beep()
+
+    def _webhook(self, title: str, body: str, payload: dict):
+        url = str(self.s["webhook_url"]).strip()
+        try:
+            if "discord.com/api/webhooks" in url or "discordapp.com/api/webhooks" in url:
+                data = self._discord_body(title, body, payload)
+            else:
+                data = {"title": title, "message": body, **payload}
+            status = _post_json(url, data)
+            log.info("webhook sent (%s)", status)
+        except Exception as e:
+            log.warning("webhook failed: %s", e)
+
+    @staticmethod
+    def _discord_body(title: str, body: str, payload: dict) -> dict:
+        """Discord embed: one line per character with a status dot,
+        embed color = worst character's state."""
+        chars = (payload or {}).get("characters")
+        if chars:
+            def dot(p):
+                return "🔴" if p >= 90 else ("🟡" if p >= 75 else "🟢")
+            lines = [f"{dot(c['pct'])} `{c['pct']:5.1f}%` **{c['character']}** — "
+                     f"~{c['est_m3']:,} / {c['capacity_m3']:,} m³"
+                     for c in chars]
+            desc = "\n".join(lines)
+            max_pct = max(c["pct"] for c in chars)
+            color = 0xF23F43 if max_pct >= 90 else (
+                0xF0B232 if max_pct >= 75 else 0x23A55A)
+        else:
+            desc = body
+            color = 0xF0B232
+        return {"content": "@everyone",
+                "embeds": [{"title": title, "description": desc[:4000],
+                            "color": color,
+                            "footer": {"text": "Ore Hold Watcher"}}]}
+
+    def _ntfy(self, title: str, body: str):
+        topic = str(self.s["ntfy_topic"]).strip().lstrip("/")
+        url = topic if topic.startswith("http") else f"https://ntfy.sh/{topic}"
+        try:
+            req = urllib.request.Request(
+                url, data=body.encode("utf-8"),
+                headers={"Title": title, "Priority": "high",
+                         "Tags": "warning", "User-Agent": APP_NAME})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                log.info("ntfy sent (%s)", r.status)
+        except Exception as e:
+            log.warning("ntfy failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Character row widget
+# ---------------------------------------------------------------------------
+
+class CharRow(QWidget):
+    def __init__(self, main: "MainWindow", name: str):
+        super().__init__()
+        self.main = main
+        self.name = name
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.menu)
+
+        self.dot = QLabel("●")
+        self.chip = QLabel("0.0%")
+        self.chip.setObjectName("pctChip")
+        self.lbl = QLabel(name)
+        self.lbl.setObjectName("charName")
+        self.amount = QLabel("")
+        self.amount.setObjectName("amount")
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(8)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addWidget(self.dot)
+        top.addWidget(self.chip)
+        top.addWidget(self.lbl)
+        top.addStretch(1)
+        top.addWidget(self.amount)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(4)
+        lay.addLayout(top)
+        lay.addWidget(self.bar)
+
+    def update_state(self, est: float, cap: float):
+        pct = 100.0 * est / cap if cap else 0.0
+        col = fill_color(pct)
+        self.dot.setStyleSheet(f"color: {col}; font-size: 14px;")
+        self.chip.setText(f"{pct:.1f}%")
+        self.amount.setText(f"~{est:,.0f} / {cap:,.0f} m³")
+        self.bar.setValue(int(min(pct, 100) * 10))
+        self.bar.setStyleSheet(
+            f"QProgressBar::chunk {{ background: {col}; border-radius: 4px; }}")
+
+    def menu(self, pos):
+        m = QMenu(self)
+        m.addAction("Reset (hold emptied)", lambda: self.main.reset_char(self.name))
+        m.addAction("Set current m³…", lambda: self.main.calibrate_char(self.name))
+        m.addAction("Set capacity…", lambda: self.main.capacity_char(self.name))
+        m.addSeparator()
+        m.addAction("Remove from list", lambda: self.main.remove_char(self.name))
+        m.exec(self.mapToGlobal(pos))
+
+
+# ---------------------------------------------------------------------------
+# Settings dialog
+# ---------------------------------------------------------------------------
+
+class SettingsDialog(QDialog):
+    def __init__(self, settings: Settings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.s = settings
+
+        self.log_dir = QLineEdit(str(settings["log_dir"] or ""))
+        self.log_dir.setPlaceholderText("(auto-detect)")
+        browse = QPushButton("…")
+        browse.setFixedWidth(30)
+        browse.clicked.connect(self.pick_dir)
+        row = QHBoxLayout()
+        row.addWidget(self.log_dir)
+        row.addWidget(browse)
+
+        self.threshold = QDoubleSpinBox()
+        self.threshold.setRange(1, 100)
+        self.threshold.setSuffix(" %")
+        self.threshold.setValue(float(settings["threshold_pct"]))
+
+        self.capacity = QDoubleSpinBox()
+        self.capacity.setRange(1, 10_000_000)
+        self.capacity.setDecimals(0)
+        self.capacity.setSuffix(" m³")
+        self.capacity.setValue(float(settings["default_capacity"]))
+
+        # alert methods
+        self.interval = QDoubleSpinBox()
+        self.interval.setRange(0, 1440)
+        self.interval.setDecimals(1)
+        self.interval.setSuffix(" min")
+        self.interval.setToolTip("At most one alert per this many minutes "
+                                 "(0 = alert on every crossing)")
+        self.interval.setValue(float(settings["alert_interval_min"]))
+
+        self.m_popup = QCheckBox("Pop-up notification (Windows toast)")
+        self.m_popup.setChecked(bool(settings["notify_popup"]))
+        self.m_overlay = QCheckBox("On-screen overlay banner (always on top)")
+        self.m_overlay.setChecked(bool(settings["notify_overlay"]))
+        self.m_sound = QCheckBox("Sound (system ding)")
+        self.m_sound.setChecked(bool(settings["notify_sound"]))
+        self.m_webhook = QCheckBox("Webhook (Discord webhook URL or any HTTP endpoint)")
+        self.m_webhook.setChecked(bool(settings["notify_webhook"]))
+        self.webhook_url = QLineEdit(str(settings["webhook_url"]))
+        self.webhook_url.setPlaceholderText("https://discord.com/api/webhooks/…")
+        self.m_ntfy = QCheckBox("Phone push via ntfy.sh (free app, no account)")
+        self.m_ntfy.setChecked(bool(settings["notify_ntfy"]))
+        self.ntfy_topic = QLineEdit(str(settings["ntfy_topic"]))
+        self.ntfy_topic.setPlaceholderText("your-secret-topic-name")
+        self.test_btn = QPushButton("Send test alert")
+
+        # downtime auto-close
+        self.dt_close = QCheckBox("Force-close all EVE clients before daily "
+                                  "downtime (11:00 UTC cluster shutdown)")
+        self.dt_close.setChecked(bool(settings["close_before_downtime"]))
+        self.dt_lead = QDoubleSpinBox()
+        self.dt_lead.setRange(0.5, 120)
+        self.dt_lead.setDecimals(1)
+        self.dt_lead.setSuffix(" min before")
+        self.dt_lead.setValue(float(settings["close_minutes_before"]))
+
+        self.ontop = QCheckBox("Window always on top")
+        self.ontop.setChecked(bool(settings["always_on_top"]))
+        self.comp_out = QCheckBox("Compressed ore is moved out of the ore hold\n"
+                                  "(compression frees the full raw volume)")
+        self.comp_out.setChecked(bool(settings["compressed_leaves_hold"]))
+        self.dbg = QCheckBox("Verbose debug logging (every mining cycle)")
+        self.dbg.setChecked(bool(settings["debug_verbose"]))
+        self.open_log = QPushButton("Open debug log")
+        self.open_log.clicked.connect(
+            lambda: os.startfile(config_dir() / "debug.log")
+            if sys.platform == "win32" else None)
+
+        form = QFormLayout(self)
+        form.addRow("Gamelogs folder:", row)
+        form.addRow("Alert threshold:", self.threshold)
+        form.addRow("Default ore hold capacity:", self.capacity)
+        lab = QLabel("Alert methods (at threshold):")
+        lab.setStyleSheet("font-weight: 700; margin-top: 8px;")
+        form.addRow(lab)
+        form.addRow("Min. time between alerts:", self.interval)
+        form.addRow(self.m_popup)
+        form.addRow(self.m_overlay)
+        form.addRow(self.m_sound)
+        form.addRow(self.m_webhook)
+        form.addRow("Webhook URL:", self.webhook_url)
+        form.addRow(self.m_ntfy)
+        form.addRow("ntfy topic:", self.ntfy_topic)
+        form.addRow(self.test_btn)
+        lab2 = QLabel("Downtime:")
+        lab2.setStyleSheet("font-weight: 700; margin-top: 8px;")
+        form.addRow(lab2)
+        form.addRow(self.dt_close)
+        form.addRow("Close clients:", self.dt_lead)
+        form.addRow(self.ontop)
+        form.addRow(self.comp_out)
+        form.addRow(self.dbg)
+        form.addRow(self.open_log)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def pick_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Gamelogs folder",
+                                             self.log_dir.text())
+        if d:
+            self.log_dir.setText(d)
+
+    def apply(self):
+        self.s["log_dir"] = self.log_dir.text()
+        self.s["threshold_pct"] = self.threshold.value()
+        self.s["default_capacity"] = self.capacity.value()
+        self.s["alert_interval_min"] = self.interval.value()
+        self.s["close_before_downtime"] = self.dt_close.isChecked()
+        self.s["close_minutes_before"] = self.dt_lead.value()
+        self.s["notify_popup"] = self.m_popup.isChecked()
+        self.s["notify_overlay"] = self.m_overlay.isChecked()
+        self.s["notify_sound"] = self.m_sound.isChecked()
+        self.s["notify_webhook"] = self.m_webhook.isChecked()
+        self.s["webhook_url"] = self.webhook_url.text().strip()
+        self.s["notify_ntfy"] = self.m_ntfy.isChecked()
+        self.s["ntfy_topic"] = self.ntfy_topic.text().strip()
+        self.s["always_on_top"] = self.ontop.isChecked()
+        self.s["compressed_leaves_hold"] = self.comp_out.isChecked()
+        self.s["debug_verbose"] = self.dbg.isChecked()
+        logging.getLogger("orewatcher").setLevel(
+            logging.DEBUG if self.dbg.isChecked() else logging.INFO)
+        self.s.save()
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.settings = Settings()
+        self.warned_ores: set[str] = set()
+
+        # resolve the watch folder: explicit setting if it exists,
+        # otherwise auto-detect for the active user
+        configured = str(self.settings["log_dir"] or "").strip()
+        watch_dir = None
+        if configured:
+            p = Path(configured)
+            if p.is_dir() and any(p.glob("*.txt")):
+                watch_dir = p
+            else:
+                log.warning("configured log_dir missing or has no logs (%s); "
+                            "auto-detecting", configured)
+        if watch_dir is None:
+            watch_dir = detect_log_dir()
+
+        self.engine = Engine(
+            log_dir=watch_dir,
+            state_path=config_dir() / "state.json",
+            ore_override_path=config_dir() / "ores_override.json",
+            mining_patterns=self.settings["mining_patterns"] or None,
+            lookback_hours=float(self.settings["lookback_hours"]),
+            default_capacity=float(self.settings["default_capacity"]),
+            compressed_leaves_hold=bool(self.settings["compressed_leaves_hold"]),
+        )
+
+        self.setWindowTitle(APP_NAME)
+        self.resize(430, 480)
+        self.apply_on_top()
+
+        central = QWidget()
+        v = QVBoxLayout(central)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(8)
+
+        hdr = QHBoxLayout()
+        title = QLabel("⛏  Fleet Ore Holds")
+        title.setStyleSheet("font-size: 15px; font-weight: 700;")
+        hdr.addWidget(title)
+        hdr.addStretch(1)
+        b_reset = QPushButton("Reset all")
+        b_reset.clicked.connect(self.reset_all)
+        b_cfg = QPushButton("⚙")
+        b_cfg.setFixedWidth(34)
+        b_cfg.clicked.connect(self.open_settings)
+        hdr.addWidget(b_reset)
+        hdr.addWidget(b_cfg)
+        v.addLayout(hdr)
+
+        self.status = QLabel("")
+        self.status.setObjectName("amount")
+        self.status.setWordWrap(True)
+        v.addWidget(self.status)
+
+        self.rows_box = QVBoxLayout()
+        self.rows_box.setSpacing(6)
+        wrap = QWidget()
+        outer = QVBoxLayout(wrap)
+        outer.addLayout(self.rows_box)
+        outer.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(wrap)
+        v.addWidget(scroll, 1)
+
+        self.setCentralWidget(central)
+        self.rows: dict[str, tuple[QWidget, CharRow]] = {}
+
+        # Tray
+        self.tray = QSystemTrayIcon(make_tray_icon(0), self)
+        self.tray.setToolTip(APP_NAME)
+        menu = QMenu()
+        menu.addAction("Show / Hide", self.toggle_visible)
+        menu.addAction("Reset all holds", self.reset_all)
+        menu.addSeparator()
+        if sys.platform == "win32":
+            menu.addAction("Open debug log",
+                           lambda: os.startfile(config_dir() / "debug.log"))
+        menu.addAction("Quit", self.quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda r: self.toggle_visible() if r == QSystemTrayIcon.Trigger else None)
+        self.tray.show()
+
+        self.notifier = Notifier(self.settings, self.tray)
+        self._last_alert_ts = 0.0     # rate limiter for threshold alerts
+        self._alert_pending = False
+        self._pending_title = ""
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(int(float(self.settings["poll_seconds"]) * 1000))
+        self.tick()
+
+    # -- helpers -------------------------------------------------------------
+    def apply_on_top(self):
+        flags = self.windowFlags()
+        if self.settings["always_on_top"]:
+            flags |= Qt.WindowStaysOnTopHint
+        else:
+            flags &= ~Qt.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+
+    def toggle_visible(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    def closeEvent(self, ev):  # close -> minimize to tray
+        ev.ignore()
+        self.hide()
+        self.tray.showMessage(APP_NAME, "Still watching in the tray. "
+                              "Right-click the icon to quit.",
+                              QSystemTrayIcon.Information, 2500)
+
+    def quit(self):
+        self.engine.save_state()
+        self.tray.hide()
+        QApplication.quit()
+
+    # -- notifications --------------------------------------------------------
+    def notify(self, title: str, body: str, payload: dict | None = None):
+        self.notifier.alert(title, body, payload)
+
+    def fleet_summary(self) -> tuple[str, dict]:
+        """All characters' current state, fullest first."""
+        chars = sorted(self.engine.chars.values(),
+                       key=lambda c: c.pct, reverse=True)
+        lines = [f"{c.name} — ~{c.est_m3:,.0f} / {c.capacity:,.0f} m³ "
+                 f"({c.pct:.1f}%)" for c in chars]
+        payload = {"characters": [
+            {"character": c.name, "est_m3": round(c.est_m3),
+             "capacity_m3": round(c.capacity), "pct": round(c.pct, 1)}
+            for c in chars]}
+        return "\n".join(lines) or "No characters tracked yet.", payload
+
+    def request_alert(self, title: str):
+        """Queue a threshold alert; sent as a full-fleet digest, at most one
+        per alert_interval_min minutes (a suppressed alert is sent as soon
+        as the interval expires)."""
+        self._pending_title = title
+        self._alert_pending = True
+        self._flush_alert()
+
+    def _flush_alert(self):
+        if not self._alert_pending:
+            return
+        interval = max(0.0, float(self.settings["alert_interval_min"])) * 60.0
+        now = time.time()
+        if now - self._last_alert_ts < interval:
+            return  # rate-limited; tick() retries until the window opens
+        self._last_alert_ts = now
+        self._alert_pending = False
+        body, payload = self.fleet_summary()
+        self.notifier.alert(self._pending_title, body, payload)
+
+    # -- downtime auto-close ---------------------------------------------------
+    def _check_downtime_close(self):
+        if not self.settings["close_before_downtime"]:
+            return
+        try:
+            hh, mm = str(self.settings["downtime_utc"]).split(":")
+            from datetime import datetime, timedelta, timezone
+            now = datetime.now(timezone.utc)
+            dt_today = now.replace(hour=int(hh), minute=int(mm),
+                                   second=0, microsecond=0)
+            shutdown = dt_today if now <= dt_today else dt_today + timedelta(days=1)
+            lead = timedelta(minutes=max(0.5, float(
+                self.settings["close_minutes_before"])))
+            in_window = shutdown - lead <= now < shutdown
+        except Exception as e:
+            log.warning("downtime check failed: %s", e)
+            return
+        today_key = shutdown.strftime("%Y-%m-%d")
+        if not in_window or getattr(self, "_closed_for", None) == today_key:
+            return
+        self._closed_for = today_key
+        killed = self._force_close_eve()
+        self.notifier.alert(
+            "⏻ EVE downtime in <" + f"{lead.seconds // 60} min — clients closed",
+            f"Force-closed {killed} EVE client process(es) ahead of the "
+            f"{self.settings['downtime_utc']} UTC cluster shutdown.",
+            {"event": "downtime_close", "processes_killed": killed})
+
+    def _force_close_eve(self) -> int:
+        """taskkill /F every configured EVE client process. Returns count."""
+        import subprocess
+        names = self.settings["eve_process_names"] or ["exefile.exe"]
+        killed = 0
+        for name in names:
+            try:
+                if sys.platform == "win32":
+                    r = subprocess.run(
+                        ["taskkill", "/F", "/IM", name],
+                        capture_output=True, text=True, timeout=30,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    out = (r.stdout or "") + (r.stderr or "")
+                    killed += out.upper().count("SUCCESS")
+                    log.info("taskkill %s -> rc=%s %s", name, r.returncode,
+                             out.strip().replace("\n", " | "))
+                else:
+                    r = subprocess.run(["pkill", "-9", "-f", name],
+                                       capture_output=True, timeout=30)
+                    killed += 1 if r.returncode == 0 else 0
+            except Exception as e:
+                log.warning("force close %s failed: %s", name, e)
+        return killed
+
+    # -- actions ---------------------------------------------------------------
+    def reset_all(self):
+        self.engine.reset_all()
+        self.refresh()
+
+    def reset_char(self, name: str):
+        self.engine.reset(name)
+        self.refresh()
+
+    def calibrate_char(self, name: str):
+        c = self.engine.char(name)
+        val, ok = QInputDialog.getDouble(
+            self, "Set current amount",
+            f"Current ore in {name}'s hold (m³):", c.est_m3, 0,
+            10_000_000, 0)
+        if ok:
+            self.engine.calibrate(name, val)
+            self.refresh()
+
+    def capacity_char(self, name: str):
+        c = self.engine.char(name)
+        val, ok = QInputDialog.getDouble(
+            self, "Set capacity",
+            f"Ore hold capacity for {name} (m³):", c.capacity, 1,
+            10_000_000, 0)
+        if ok:
+            self.engine.set_capacity(name, val)
+            self.refresh()
+
+    def remove_char(self, name: str):
+        self.engine.remove(name)
+        self.refresh()
+
+    def open_settings(self):
+        dlg = SettingsDialog(self.settings, self)
+
+        def send_test():
+            dlg.apply()  # so the test uses what's currently ticked/typed
+            body, payload = self.fleet_summary()  # real current fleet state
+            self.notifier.alert("⚠ Test alert — Ore Hold Watcher", body, payload)
+        dlg.test_btn.clicked.connect(send_test)
+
+        if dlg.exec() == QDialog.Accepted:
+            dlg.apply()
+            configured = str(self.settings["log_dir"] or "").strip()
+            self.engine.log_dir = (Path(configured) if configured and
+                                   Path(configured).is_dir() else detect_log_dir())
+            self.engine.default_capacity = float(self.settings["default_capacity"])
+            self.engine.compressed_leaves_hold = bool(
+                self.settings["compressed_leaves_hold"])
+            self.apply_on_top()
+            self.show()
+            self.refresh()
+
+    # -- main loop --------------------------------------------------------------
+    def tick(self):
+        events = self.engine.poll()
+        threshold = float(self.settings["threshold_pct"])
+        rearm = threshold - float(self.settings["rearm_margin_pct"])
+        for ev in events:
+            if isinstance(ev, HoldFullEvent):
+                c = self.engine.char(ev.character)
+                if not c.notified:
+                    c.notified = True
+                    self.request_alert(f"⚠ {ev.character} — ore hold FULL")
+            elif isinstance(ev, UnknownOreEvent):
+                if ev.ore not in self.warned_ores:
+                    self.warned_ores.add(ev.ore)
+                    self.notify("Unknown ore type",
+                                f"'{ev.ore}' isn't in the volume table — add it to "
+                                f"ores_override.json (Settings folder) so it counts.")
+        # threshold crossings / re-arm
+        for c in self.engine.chars.values():
+            if c.pct >= threshold and not c.notified:
+                c.notified = True
+                self.request_alert(f"⚠ {c.name} — {c.pct:.1f}% full")
+            elif c.pct < rearm and c.notified:
+                c.notified = False
+        self._flush_alert()          # send any alert the rate limiter held back
+        self._check_downtime_close()
+        self.refresh()
+
+    def refresh(self):
+        chars = sorted(self.engine.chars.values(),
+                       key=lambda c: c.pct, reverse=True)
+        wanted = [c.name for c in chars]
+        # drop rows for removed chars
+        for name in list(self.rows):
+            if name not in wanted:
+                frame, _ = self.rows.pop(name)
+                frame.setParent(None)
+                frame.deleteLater()
+        # (re)build rows in order
+        for i, c in enumerate(chars):
+            if c.name not in self.rows:
+                from PySide6.QtWidgets import QFrame
+                frame = QFrame()
+                frame.setObjectName("row")
+                lay = QVBoxLayout(frame)
+                lay.setContentsMargins(0, 0, 0, 0)
+                row = CharRow(self, c.name)
+                lay.addWidget(row)
+                self.rows[c.name] = (frame, row)
+            frame, row = self.rows[c.name]
+            self.rows_box.removeWidget(frame)
+            self.rows_box.insertWidget(i, frame)
+            row.update_state(c.est_m3, c.capacity)
+
+        s = self.engine.stats
+        dir_ok = self.engine.log_dir.is_dir()
+        parts = [f"{'Watching' if dir_ok else '⚠ MISSING FOLDER'}: "
+                 f"{self.engine.log_dir}",
+                 f"{len(self.engine.files)} log files · "
+                 f"{s['lines']:,} lines · {s['mining_events']:,} mining · "
+                 f"{s['compress_events']} compressions"]
+        if s["unmatched_mining"]:
+            parts.append(f"⚠ {s['unmatched_mining']} unrecognized mining "
+                         f"lines — see debug.log")
+        if not chars:
+            parts.append("No mining activity seen yet — characters appear "
+                         "automatically once their gamelogs show mining.")
+        self.status.setText("\n".join(parts))
+        self.status.setStyleSheet(
+            "color: #f0b232;" if (not dir_ok or s["unmatched_mining"])
+            else "color: #949ba4;")
+
+        max_pct = max((c.pct for c in chars), default=0.0)
+        self.tray.setIcon(make_tray_icon(max_pct))
+        tip = "\n".join(f"{c.pct:.1f}%  {c.name}" for c in chars[:8]) or APP_NAME
+        self.tray.setToolTip(tip)
+
+
+def main():
+    try:
+        verbose = json.loads((config_dir() / "settings.json").read_text(
+            encoding="utf-8")).get("debug_verbose", False)
+    except Exception:
+        verbose = False
+    setup_logging(verbose)
+    log.info("=== Ore Hold Watcher starting (user=%s) ===", os.environ.get(
+        "USERNAME") or os.environ.get("USER") or "?")
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    app.setApplicationName(APP_NAME)
+    app.setStyleSheet(DARK_QSS)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

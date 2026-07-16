@@ -1,0 +1,2 @@
+PySide6>=6.6
+winotify>=1.1 ; sys_platform == 'win32'

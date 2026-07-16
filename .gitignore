@@ -1,0 +1,16 @@
+# runtime config/state (lives beside the exe — user-specific, don't commit)
+settings.json
+state.json
+ores_override.json
+debug.log
+debug.log.*
+.write_test
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# build output
+build/
+*.exe
