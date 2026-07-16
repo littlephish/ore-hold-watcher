@@ -1,4 +1,4 @@
-"""Ore Hold Watcher — local EVE Online ore hold tracker.
+"""Ore Hold Watcher - local EVE Online ore hold tracker.
 
 Sits in the system tray, tails your EVE gamelogs, estimates each character's
 ore hold fill, and pops a Windows notification when a hold crosses the alert
@@ -480,7 +480,7 @@ class Notifier:
                 if m <= 0:
                     return " · **FULL**"
                 return f" · full in {m//60}h {m%60:02d}m" if m >= 60 else f" · full in {m}m"
-            lines = [f"{dot(c['pct'])} `{c['pct']:5.1f}%` **{c['character']}** — "
+            lines = [f"{dot(c['pct'])} `{c['pct']:5.1f}%` **{c['character']}** - "
                      f"~{c['est_m3']:,} / {c['capacity_m3']:,} m³{eta_txt(c)}"
                      for c in chars]
             desc = "\n".join(lines)
@@ -623,7 +623,7 @@ class OreHoldInfoDialog(DarkDialog):
         note = QLabel("Hold sizes grow +5%/level from Mining Barge "
                       "(Retriever, Mackinaw), Industrial Command Ships "
                       "(Porpoise, Orca) or Capital Industrial Ships "
-                      "(Rorqual). Max-skill column assumes level V — an "
+                      "(Rorqual). Max-skill column assumes level V - an "
                       "Orca at ICS IV is 180,000 m³.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #949ba4;")
@@ -986,7 +986,7 @@ class MainWindow(QMainWindow):
         for c in chars:
             eta = c.eta_full_s()
             eta_txt = f" · full in {fmt_eta(eta)}" if eta else ""
-            lines.append(f"{c.name} — ~{c.est_m3:,.0f} / {c.capacity:,.0f} m³ "
+            lines.append(f"{c.name} - ~{c.est_m3:,.0f} / {c.capacity:,.0f} m³ "
                          f"({c.pct:.1f}%){eta_txt}")
             payload_chars.append(
                 {"character": c.name, "est_m3": round(c.est_m3),
@@ -1038,7 +1038,7 @@ class MainWindow(QMainWindow):
         self._closed_for = today_key
         killed = self._force_close_eve()
         self.notifier.alert(
-            "⏻ EVE downtime in <" + f"{lead.seconds // 60} min — clients closed",
+            "⏻ EVE downtime in <" + f"{lead.seconds // 60} min - clients closed",
             f"Force-closed {killed} EVE client process(es) ahead of the "
             f"{self.settings['downtime_utc']} UTC cluster shutdown.",
             {"event": "downtime_close", "processes_killed": killed})
@@ -1110,7 +1110,7 @@ class MainWindow(QMainWindow):
         def send_test():
             dlg.apply()  # so the test uses what's currently ticked/typed
             body, payload = self.fleet_summary()  # real current fleet state
-            self.notifier.alert("⚠ Test alert — Ore Hold Watcher", body, payload)
+            self.notifier.alert("⚠ Test alert - Ore Hold Watcher", body, payload)
         dlg.test_btn.clicked.connect(send_test)
 
         if dlg.exec() == QDialog.Accepted:
@@ -1135,18 +1135,18 @@ class MainWindow(QMainWindow):
                 c = self.engine.char(ev.character)
                 if not c.notified:
                     c.notified = True
-                    self.request_alert(f"⚠ {ev.character} — ore hold FULL")
+                    self.request_alert(f"⚠ {ev.character} - ore hold FULL")
             elif isinstance(ev, UnknownOreEvent):
                 if ev.ore not in self.warned_ores:
                     self.warned_ores.add(ev.ore)
                     self.notify("Unknown ore type",
-                                f"'{ev.ore}' isn't in the volume table — add it to "
+                                f"'{ev.ore}' isn't in the volume table - add it to "
                                 f"ores_override.json (Settings folder) so it counts.")
         # threshold crossings / re-arm
         for c in self.engine.chars.values():
             if c.pct >= threshold and not c.notified:
                 c.notified = True
-                self.request_alert(f"⚠ {c.name} — {c.pct:.1f}% full")
+                self.request_alert(f"⚠ {c.name} - {c.pct:.1f}% full")
             elif c.pct < rearm and c.notified:
                 c.notified = False
         self._flush_alert()          # send any alert the rate limiter held back
@@ -1197,9 +1197,9 @@ class MainWindow(QMainWindow):
                  f"{s['compress_events']} compressions"]
         if s["unmatched_mining"]:
             parts.append(f"⚠ {s['unmatched_mining']} unrecognized mining "
-                         f"lines — see debug.log")
+                         f"lines - see debug.log")
         if not chars:
-            parts.append("No mining activity seen yet — characters appear "
+            parts.append("No mining activity seen yet - characters appear "
                          "automatically once their gamelogs show mining.")
         self.status.setText("\n".join(parts))
         self.status.setStyleSheet(

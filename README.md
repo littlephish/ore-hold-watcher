@@ -72,7 +72,7 @@ no mining cycle for 5+ minutes shows no ETA.
 ## Alerts
 
 Alerts are fleet digests: one notification listing every character
-(`Name — ~X / Y m³ (Z%) · full in 1h 32m`, fullest first), sent when any
+(`Name - ~X / Y m³ (Z%) · full in 1h 32m`, fullest first), sent when any
 character crosses the threshold. They are rate-limited to at most one per
 "Min. time between alerts" (default 5 minutes, 0 = every crossing). An
 alert suppressed by the limit sends itself the moment the window reopens.

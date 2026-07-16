@@ -472,7 +472,7 @@ class Engine:
                 if ev is None:
                     continue
                 # anchor filter: log events at/before a character's last
-                # reset/calibration are already baked into anchor_m3 —
+                # reset/calibration are already baked into anchor_m3 -
                 # skipping them makes startup replay idempotent
                 ev_ts = getattr(ev, "ts", None)
                 if ev_ts is not None:
@@ -561,7 +561,7 @@ class Engine:
             return MiningEvent(character=character, qty=qty, ore=ore,
                                m3=qty * vol, ts=m.group("ts"))
         if channel == "mining":
-            # a (mining) line none of our patterns matched — the one thing
+            # a (mining) line none of our patterns matched - the one thing
             # we most need to see when diagnosing "nothing is changing"
             self.stats["unmatched_mining"] += 1
             if self._unmatched_logged < 25:
