@@ -14,3 +14,7 @@ __pycache__/
 # build output
 build/
 *.exe
+
+# auto-update leftovers
+*.exe.new
+*.update.bat

@@ -14,6 +14,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import sys
 import threading
 import time
@@ -209,6 +210,8 @@ DEFAULT_SETTINGS = {
     "notify_ntfy": False,      # push to your phone via ntfy.sh
     "ntfy_topic": "",
     "hide_idle_hours": 12,   # hide chars with no activity for this long (0 = never hide)
+    "update_check": True,    # check GitHub releases for a newer exe
+    "update_repo": "",       # "owner/repo" of this app on GitHub
     "window_size": [560, 500],  # remembered across runs
     "mining_patterns": [],    # optional custom regexes; empty = built-in defaults
 }
@@ -336,6 +339,163 @@ def style_titlebar(win):
         dwm.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(text), 4)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Auto-update (GitHub releases)
+# ---------------------------------------------------------------------------
+
+def parse_ver(s: str) -> tuple:
+    nums = re.findall(r"\d+", s or "")
+    return tuple(int(n) for n in nums[:4]) if nums else (0,)
+
+
+def is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
+
+
+def current_exe_version() -> str | None:
+    """Version stamped into the running exe by the release build.
+    None when running from source (auto-update is disabled then)."""
+    if not (is_frozen() and sys.platform == "win32"):
+        return None
+    try:
+        import ctypes
+        path = sys.executable
+        size = ctypes.windll.version.GetFileVersionInfoSizeW(path, None)
+        if not size:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        ctypes.windll.version.GetFileVersionInfoW(path, 0, size, buf)
+        val = ctypes.c_void_p()
+        vlen = ctypes.c_uint()
+        if not ctypes.windll.version.VerQueryValueW(
+                buf, "\\", ctypes.byref(val), ctypes.byref(vlen)):
+            return None
+
+        class VSFixed(ctypes.Structure):
+            _fields_ = [("sig", ctypes.c_uint32), ("strucver", ctypes.c_uint32),
+                        ("ms", ctypes.c_uint32), ("ls", ctypes.c_uint32),
+                        ("pms", ctypes.c_uint32), ("pls", ctypes.c_uint32),
+                        ("rest", ctypes.c_uint32 * 7)]
+        ffi = ctypes.cast(val, ctypes.POINTER(VSFixed)).contents
+        return f"{ffi.ms >> 16}.{ffi.ms & 0xFFFF}.{ffi.ls >> 16}"
+    except Exception as e:
+        log.debug("exe version lookup failed: %s", e)
+        return None
+
+
+class Updater:
+    """Checks GitHub releases, downloads the new exe, swaps it in place.
+    Network work runs in daemon threads; the UI polls the fields."""
+
+    def __init__(self, settings: Settings):
+        self.s = settings
+        self.busy = False
+        self.available: dict | None = None   # {"version", "url"}
+        self.up_to_date: str | None = None   # latest tag when already current
+        self.error: str | None = None
+        self.downloaded: str | None = None   # path of the fetched .new file
+        self.manual = False
+
+    def repo(self) -> str:
+        return str(self.s["update_repo"]).strip().strip("/")
+
+    def can_update(self) -> bool:
+        return bool(self.repo()) and is_frozen() and sys.platform == "win32"
+
+    # -- phase 1: check ------------------------------------------------------
+    def check_async(self, manual: bool = False):
+        if self.busy or not self.repo():
+            return
+        self.busy = True
+        self.manual = manual
+        threading.Thread(target=self._check, daemon=True).start()
+
+    def _check(self):
+        try:
+            url = f"https://api.github.com/repos/{self.repo()}/releases/latest"
+            req = urllib.request.Request(url, headers={
+                "User-Agent": APP_NAME,
+                "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            tag = str(data.get("tag_name", ""))
+            asset = next((a for a in data.get("assets", [])
+                          if a.get("name", "").lower().endswith(".exe")), None)
+            cur = current_exe_version() or "0"
+            log.info("update check: current=%s latest=%s", cur, tag)
+            if asset and parse_ver(tag) > parse_ver(cur):
+                self.available = {"version": tag,
+                                  "url": asset["browser_download_url"],
+                                  "current": cur}
+            else:
+                self.up_to_date = tag or "unknown"
+        except Exception as e:
+            log.warning("update check failed: %s", e)
+            self.error = str(e)
+        finally:
+            self.busy = False
+
+    # -- phase 2: download ---------------------------------------------------
+    def download_async(self, url: str):
+        if self.busy:
+            return
+        self.busy = True
+        threading.Thread(target=self._download, args=(url,),
+                         daemon=True).start()
+
+    def _download(self, url: str):
+        try:
+            dest = sys.executable + ".new"
+            req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+            with urllib.request.urlopen(req, timeout=300) as r, \
+                    open(dest, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            if os.path.getsize(dest) < 5_000_000:  # sanity: a real exe is big
+                raise ValueError("downloaded file suspiciously small")
+            self.downloaded = dest
+            log.info("update downloaded: %s (%d bytes)", dest,
+                     os.path.getsize(dest))
+        except Exception as e:
+            log.warning("update download failed: %s", e)
+            self.error = str(e)
+        finally:
+            self.busy = False
+
+    # -- phase 3: swap + restart ---------------------------------------------
+    def apply(self) -> bool:
+        """Write a swap script that waits for this process to exit, replaces
+        the exe, and relaunches it. Caller must quit right after."""
+        if not self.downloaded:
+            return False
+        import subprocess
+        exe = sys.executable
+        bat = exe + ".update.bat"
+        pid = os.getpid()
+        with open(bat, "w", encoding="ascii") as f:
+            f.write(f"""@echo off
+:wait
+tasklist /fi "PID eq {pid}" 2>nul | find "{pid}" >nul
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >nul
+    goto wait
+)
+move /y "{self.downloaded}" "{exe}" >nul
+start "" "{exe}"
+del "%~f0"
+""")
+        subprocess.Popen(
+            ["cmd", "/c", bat],
+            creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                           | getattr(subprocess, "DETACHED_PROCESS", 0)),
+            close_fds=True)
+        log.info("update swap script launched; exiting for replacement")
+        return True
 
 
 class DarkDialog(QDialog):
@@ -823,6 +983,11 @@ class SettingsDialog(DarkDialog):
         self.comp_out = QCheckBox("Compressed ore is moved out of the ore hold\n"
                                   "(compression frees the full raw volume)")
         self.comp_out.setChecked(bool(settings["compressed_leaves_hold"]))
+        self.upd_check = QCheckBox("Check GitHub for app updates (daily)")
+        self.upd_check.setChecked(bool(settings["update_check"]))
+        self.upd_repo = QLineEdit(str(settings["update_repo"]))
+        self.upd_repo.setPlaceholderText("owner/repo  (e.g. jrod/ore-hold-watcher)")
+
         self.dbg = QCheckBox("Debug logging to debug.log (verbose; off = "
                              "no log file is written)")
         self.dbg.setChecked(bool(settings["debug_verbose"]))
@@ -842,6 +1007,8 @@ class SettingsDialog(DarkDialog):
         gf.addRow("Default ore hold capacity:", cap_row)
         gf.addRow(self.ontop)
         gf.addRow(self.comp_out)
+        gf.addRow(self.upd_check)
+        gf.addRow("GitHub repo:", self.upd_repo)
         gf.addRow(self.dbg)
         gf.addRow(self.open_log)
         tabs.addTab(gen, "General")
@@ -916,6 +1083,8 @@ class SettingsDialog(DarkDialog):
         self.s["ntfy_topic"] = self.ntfy_topic.text().strip()
         self.s["always_on_top"] = self.ontop.isChecked()
         self.s["compressed_leaves_hold"] = self.comp_out.isChecked()
+        self.s["update_check"] = self.upd_check.isChecked()
+        self.s["update_repo"] = self.upd_repo.text().strip()
         self.s["debug_verbose"] = self.dbg.isChecked()
         logging.getLogger("orewatcher").setLevel(
             logging.DEBUG if self.dbg.isChecked() else logging.INFO)
@@ -1018,6 +1187,7 @@ class MainWindow(QMainWindow):
         menu.addAction("Show / Hide", self.toggle_visible)
         menu.addAction("Recalculate from logs", self.recalculate)
         menu.addAction("Reset all holds to 0", self.reset_all)
+        menu.addAction("Check for updates", self.manual_update_check)
         menu.addSeparator()
         if sys.platform == "win32":
             menu.addAction("Open debug log",
@@ -1030,6 +1200,12 @@ class MainWindow(QMainWindow):
         self.tray.show()
 
         self.notifier = Notifier(self.settings, self.tray)
+        self.updater = Updater(self.settings)
+        self._update_prompted: set[str] = set()
+        self._last_update_check = 0.0
+        if self.settings["update_check"] and self.updater.can_update():
+            QTimer.singleShot(20_000, lambda: self.updater.check_async())
+            self._last_update_check = time.time()
         self._last_alert_ts = 0.0     # rate limiter for threshold alerts
         self._alert_pending = False
         self._pending_title = ""
@@ -1245,6 +1421,55 @@ class MainWindow(QMainWindow):
             self.show()
             self.refresh()
 
+    # -- updates -----------------------------------------------------------------
+    def manual_update_check(self):
+        if not self.updater.repo():
+            QMessageBox.information(
+                self, "Updates", "Set the GitHub repo (owner/repo) in "
+                "Settings > General first.")
+            return
+        if not is_frozen():
+            QMessageBox.information(
+                self, "Updates", "Running from source - update by pulling "
+                "the repo. Auto-update only applies to the built exe.")
+            return
+        self.updater.check_async(manual=True)
+
+    def _pump_updates(self):
+        u = self.updater
+        if u.error:
+            err, u.error = u.error, None
+            if u.manual:
+                QMessageBox.warning(self, "Update check failed", err)
+        if u.up_to_date:
+            tag, u.up_to_date = u.up_to_date, None
+            if u.manual:
+                QMessageBox.information(
+                    self, "Updates",
+                    f"You're on the latest version ({tag}).")
+        if u.available:
+            info, u.available = u.available, None
+            if info["version"] not in self._update_prompted:
+                self._update_prompted.add(info["version"])
+                ans = QMessageBox.question(
+                    self, "Update available",
+                    f"Version {info['version']} is available "
+                    f"(you have {info['current']}).\n\n"
+                    "Download and restart to update now?",
+                    QMessageBox.Yes | QMessageBox.No)
+                if ans == QMessageBox.Yes:
+                    u.download_async(info["url"])
+        if u.downloaded:
+            if u.apply():          # swap script waits for our exit
+                self.quit()
+            else:
+                u.downloaded = None
+        # daily re-check
+        if (self.settings["update_check"] and u.can_update() and
+                time.time() - self._last_update_check > 86_400):
+            self._last_update_check = time.time()
+            u.check_async()
+
     # -- main loop --------------------------------------------------------------
     def tick(self):
         events = self.engine.poll()
@@ -1288,6 +1513,7 @@ class MainWindow(QMainWindow):
                         f"⏸ {c.name} - no ore ticks for {int(gap // 60)} min")
         self._flush_alert()          # send any alert the rate limiter held back
         self._check_downtime_close()
+        self._pump_updates()
         self.refresh()
 
     def refresh(self):

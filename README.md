@@ -174,6 +174,25 @@ closed. It fires once per day and only while the app is
 running. Force-kill skips the graceful logout, so ships get EVE's normal
 emergency-warp handling, which is the point of doing it before shutdown.
 
+## Auto-update
+
+Once the app is published on GitHub with the release workflow, the built
+exe can update itself. Set "GitHub repo" on the Settings General tab to
+your `owner/repo` and leave "Check GitHub for app updates" ticked. The app
+checks the latest release 20 seconds after launch and daily after that;
+the tray menu also has "Check for updates" for an on-demand check.
+
+When a newer version exists you get a prompt showing both versions. Accept
+and the app downloads the new exe next to the current one, writes a small
+swap script, exits, and the script replaces the exe and relaunches it.
+Your settings and state are untouched (they live beside the exe and are
+not part of the download). Decline and it won't nag again about that
+version until the next restart.
+
+Version comparison uses the version stamped into the exe by
+`release.yml`, so it only works for exes built from a tag. Running from
+source? The updater stays out of the way: update with `git pull`.
+
 ## CI and releases (GitHub)
 
 Push this folder to a GitHub repo and two workflows take over:
@@ -218,6 +237,57 @@ The Gamelogs folder is auto-detected for the active user via the Windows
 known-folder API (which follows OneDrive-redirected Documents), then the
 `%OneDrive%` environment variable, then plain `~\Documents`. Set it in
 Settings only if yours lives somewhere else entirely.
+
+## EULA and third-party policy notes
+
+CCP's third-party policies prohibit botting, modifying the game client or
+its UI, reverse engineering, cache scraping, input broadcasting, and tools
+that acquire items or currency at an accelerated rate. This app does none
+of those things:
+
+- It reads only the plain-text gamelog files the EVE client itself writes
+  to `Documents\EVE\logs\Gamelogs` when you enable "Log game messages to a
+  file". That is a supported client feature, not cache scraping or memory
+  reading. Community tools have read these logs (and chat logs, for intel)
+  for many years.
+- It never touches the EVE process, injects nothing, overlays nothing into
+  the game, and modifies no game files. CCP has stated they "only care
+  about what is going on in the EVE process"; this app stays entirely
+  outside it.
+- It sends no input to the game and automates no gameplay. It counts and
+  notifies; a human still performs every action in the client. Running
+  multiple clients is itself allowed by CCP, and this app does no input
+  broadcasting between them.
+- The optional downtime feature closes client processes, the same effect
+  as closing the windows yourself. It never plays the game.
+- It is free, open source, and talks to no CCP service (no ESI, no login).
+
+One caveat, stated plainly: CCP's published position is that third-party
+software is tolerated at the player's own risk, not pre-approved. Nothing
+here is an official CCP endorsement, and this section is a good-faith
+policy reading, not legal advice. If CCP ever changes its stance on
+reading gamelogs, that change wins.
+
+## License
+
+MIT - see [LICENSE](LICENSE) for details. The license covers this app's
+code only; EVE Online and all CCP property remain CCP's, per the notice
+below.
+
+## CCP hf. copyright notice
+
+EVE Online and the EVE logo are the registered trademarks of CCP hf. All
+rights are reserved worldwide. All other trademarks are the property of
+their respective owners. EVE Online, the EVE logo, EVE and all associated
+logos and designs are the intellectual property of CCP hf. All artwork,
+screenshots, characters, vehicles, storylines, world facts or other
+recognizable features of the intellectual property relating to these
+trademarks are likewise the intellectual property of CCP hf. CCP hf. has
+granted permission to use EVE Online and all associated logos and designs
+for promotional and information purposes but does not endorse, and is not
+in any way affiliated with, Ore Hold Watcher. CCP is in no way responsible
+for the content on or functioning of this application, nor can it be
+liable for any damage arising from the use of this application.
 
 ## Troubleshooting
 
