@@ -94,6 +94,21 @@ Alerts fire once per crossing and re-arm after a reset, a compression, or
 when the fill drops 5% below the threshold. **Send test alert** sends the
 real current fleet state through every enabled method.
 
+A combat alert (off by default; the checkbox also controls whether combat
+lines are scanned at all) fires when a tracked mining character takes
+aggression from another PLAYER: incoming damage or a warp
+scramble/disruption attempt. Only pilots already in the fleet list (i.e.
+with mining activity) can trigger it; a hauler or PvP alt logged in on the
+same machine is ignored.
+NPC rats never trigger it. The filter relies on how the log renders
+attackers: players show as `Name[CORP](Ship)` with a corp ticker, rats as
+plain names. Combat alerts are urgent, so they skip the digest rate
+limiter and fire immediately, with a per-pilot cooldown (default 120 s)
+so sustained fire doesn't spam you. Two honest limits: being target-locked
+is not written to any log, so the earliest possible warning is the first
+point of actual aggression, and a player's unnamed attack drones can slip
+past the filter since they render like NPCs.
+
 An idle alert can also be enabled on the Alerts tab (on by default): if a
 pilot who was mining stops receiving ore ticks for X minutes (5 by
 default), you get one alert such as "⏸ Edgar Hendar - no ore ticks for 6

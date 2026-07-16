@@ -99,6 +99,18 @@ HOLD_FULL_MARKERS = (
 # lines that look like mining but must NOT be counted
 EXCLUDE_MARKERS = ("residue", "wasted", "lost")
 
+# --- combat (being attacked) ---
+# Incoming damage after tag-strip: "287 from Attacker - Smashes"
+COMBAT_DMG_RE = re.compile(
+    rf"^(?P<dmg>{_NUM})\s+from\s+(?P<who>.+?)(?:\s+-\s+.*)?$")
+# EWAR aimed at you: "Warp scramble attempt from Attacker to you"
+COMBAT_EWAR_RE = re.compile(
+    r"^(?P<kind>Warp (?:scramble|disruption) attempt|"
+    r"Remote sensor dampener|Sensor jam attempt)\s+from\s+(?P<who>.+?)\s+"
+    r"(?:to you|against you)", re.IGNORECASE)
+# Player attackers render as "Name[CORP](Ship)"; NPCs are plain names.
+PLAYER_ATTACKER_RE = re.compile(r"\[[^\]]{1,10}\]|\([^)]+\)\s*$")
+
 
 def parse_qty(raw: str) -> int:
     digits = re.sub(r"[^\d]", "", raw)
@@ -129,6 +141,15 @@ class UnknownOreEvent:
     character: str
     ore: str
     qty: int
+
+
+@dataclass
+class CombatEvent:
+    character: str
+    attacker: str
+    kind: str          # "damage" or the ewar kind
+    is_player: bool    # True when the attacker looks like a capsuleer
+    ts: str
 
 
 @dataclass
@@ -312,7 +333,8 @@ class Engine:
                  mining_patterns: list[str] | None = None,
                  lookback_hours: float = 24.0,
                  default_capacity: float = 180000.0,
-                 compressed_leaves_hold: bool = True):
+                 compressed_leaves_hold: bool = True,
+                 combat_enabled: bool = True):
         self.log_dir = Path(log_dir)
         self.state_path = Path(state_path)
         self.lookback_hours = lookback_hours
@@ -322,6 +344,9 @@ class Engine:
         # volume. False = compressed stacks stay in the ore hold at their
         # (tiny) compressed volume.
         self.compressed_leaves_hold = compressed_leaves_hold
+        # when False, (combat) lines are skipped at the parser level -
+        # no combat scanning happens at all
+        self.combat_enabled = combat_enabled
         self.table = OreTable(ore_override_path)
         pats = mining_patterns or DEFAULT_MINING_PATTERNS
         self.patterns = [re.compile(p, re.IGNORECASE) for p in pats]
@@ -477,9 +502,11 @@ class Engine:
                     continue
                 # anchor filter: log events at/before a character's last
                 # reset/calibration are already baked into anchor_m3 -
-                # skipping them makes startup replay idempotent
+                # skipping them makes startup replay idempotent.
+                # CombatEvents skip this: they must not create character
+                # rows (a non-mining alt getting shot is not fleet cargo)
                 ev_ts = getattr(ev, "ts", None)
-                if ev_ts is not None:
+                if ev_ts is not None and not isinstance(ev, CombatEvent):
                     c = self.char(ev.character)
                     if c.anchor_ts and ev_ts <= c.anchor_ts:
                         continue
@@ -526,6 +553,8 @@ class Engine:
         if not m:
             return None
         channel = m.group("channel").strip().lower()
+        if channel == "combat":
+            return self._parse_combat(character, m) if self.combat_enabled else None
         if channel not in MINING_CHANNELS:
             return None
         msg = TAG_RE.sub("", m.group("msg")).strip()
@@ -572,3 +601,24 @@ class Engine:
                 self._unmatched_logged += 1
                 log.warning("UNMATCHED mining line from %s: %r", character, msg)
         return None
+
+    def _parse_combat(self, character: str, m):
+        """Incoming aggression only. Outgoing lines say 'N to X' and never
+        match. is_player uses the Name[CORP](Ship) rendering; plain-named
+        NPC rats stay is_player=False and are never alerted on."""
+        msg = TAG_RE.sub("", m.group("msg")).strip()
+        dm = COMBAT_DMG_RE.match(msg)
+        who, kind = None, None
+        if dm:
+            who, kind = dm.group("who").strip(), "damage"
+        else:
+            em = COMBAT_EWAR_RE.match(msg)
+            if em:
+                who, kind = em.group("who").strip(), em.group("kind").lower()
+        if not who:
+            return None
+        is_player = bool(PLAYER_ATTACKER_RE.search(who))
+        if is_player:
+            log.info("combat: %s <- %s (%s)", character, who, kind)
+        return CombatEvent(character=character, attacker=who, kind=kind,
+                           is_player=is_player, ts=m.group("ts"))

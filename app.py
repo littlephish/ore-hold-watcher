@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox,
                                QCheckBox)
 
 from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
-                    ts_to_epoch)
+                    CombatEvent, ts_to_epoch)
 
 APP_NAME = "Ore Hold Watcher"
 ORG_DIR = "OreHoldWatcher"
@@ -194,6 +194,8 @@ DEFAULT_SETTINGS = {
     "alert_interval_min": 5.0,  # at most one alert per X minutes (0 = every alert)
     "idle_alert_enabled": True,  # alert when a pilot stops receiving ore ticks
     "idle_alert_min": 5.0,       # ... for this many minutes
+    "combat_alert_enabled": False,  # scan/alert on PLAYER aggression (never NPC)
+    "combat_alert_cooldown_s": 120,  # per-pilot cooldown between combat alerts
     # --- auto-close before EVE daily downtime (cluster shutdown 11:00 UTC) ---
     "close_before_downtime": False,       # OFF by default
     "close_minutes_before": 5.0,          # force-close X min before shutdown
@@ -926,6 +928,15 @@ class SettingsDialog(DarkDialog):
         self.idle_min.setSuffix(" min")
         self.idle_min.setValue(float(settings["idle_alert_min"]))
 
+        self.combat_on = QCheckBox("Alert when a pilot is attacked by a PLAYER "
+                                   "(NPC rats never alert)")
+        self.combat_on.setChecked(bool(settings["combat_alert_enabled"]))
+        self.combat_cd = QDoubleSpinBox()
+        self.combat_cd.setRange(10, 3600)
+        self.combat_cd.setDecimals(0)
+        self.combat_cd.setSuffix(" s cooldown / pilot")
+        self.combat_cd.setValue(float(settings["combat_alert_cooldown_s"]))
+
         self.m_popup = QCheckBox("Pop-up notification (Windows toast)")
         self.m_popup.setChecked(bool(settings["notify_popup"]))
         self.m_overlay = QCheckBox("On-screen overlay banner alert")
@@ -1018,6 +1029,8 @@ class SettingsDialog(DarkDialog):
         af.addRow("Min. time between alerts:", self.interval)
         af.addRow(self.idle_on)
         af.addRow("Idle after:", self.idle_min)
+        af.addRow(self.combat_on)
+        af.addRow("Combat re-alert:", self.combat_cd)
         af.addRow(self.m_popup)
         af.addRow(self.m_overlay)
         af.addRow(self.m_sound)
@@ -1070,6 +1083,8 @@ class SettingsDialog(DarkDialog):
         self.s["alert_interval_min"] = self.interval.value()
         self.s["idle_alert_enabled"] = self.idle_on.isChecked()
         self.s["idle_alert_min"] = self.idle_min.value()
+        self.s["combat_alert_enabled"] = self.combat_on.isChecked()
+        self.s["combat_alert_cooldown_s"] = self.combat_cd.value()
         self.s["close_before_downtime"] = self.dt_close.isChecked()
         self.s["close_minutes_before"] = self.dt_lead.value()
         self.s["notify_popup"] = self.m_popup.isChecked()
@@ -1130,6 +1145,7 @@ class MainWindow(QMainWindow):
             lookback_hours=float(self.settings["lookback_hours"]),
             default_capacity=float(self.settings["default_capacity"]),
             compressed_leaves_hold=bool(self.settings["compressed_leaves_hold"]),
+            combat_enabled=bool(self.settings["combat_alert_enabled"]),
         )
 
         self.setWindowTitle(APP_NAME)
@@ -1207,6 +1223,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(20_000, lambda: self.updater.check_async())
             self._last_update_check = time.time()
         self._last_alert_ts = 0.0     # rate limiter for threshold alerts
+        self._combat_alerted: dict[str, float] = {}  # per-pilot combat cooldown
         self._alert_pending = False
         self._pending_title = ""
 
@@ -1417,6 +1434,8 @@ class MainWindow(QMainWindow):
             self.engine.default_capacity = float(self.settings["default_capacity"])
             self.engine.compressed_leaves_hold = bool(
                 self.settings["compressed_leaves_hold"])
+            self.engine.combat_enabled = bool(
+                self.settings["combat_alert_enabled"])
             self.apply_on_top()
             self.show()
             self.refresh()
@@ -1483,6 +1502,23 @@ class MainWindow(QMainWindow):
             if (isinstance(ev, MiningEvent) and
                     now_utc - ts_to_epoch(ev.ts) < idle_after):
                 self.engine.char(ev.character).idle_notified = False
+            # PLAYER aggression: urgent, bypasses the digest rate limiter.
+            # NPC rats (is_player=False) never alert. The 2-minute liveness
+            # guard keeps startup replay of old fights silent.
+            if (isinstance(ev, CombatEvent) and ev.is_player and
+                    self.settings["combat_alert_enabled"] and
+                    ev.character in self.engine.chars and   # tracked miners only
+                    now_utc - ts_to_epoch(ev.ts) < 120):
+                cd = float(self.settings["combat_alert_cooldown_s"])
+                last = self._combat_alerted.get(ev.character, 0.0)
+                if now_utc - last >= cd:
+                    self._combat_alerted[ev.character] = now_utc
+                    body, payload = self.fleet_summary()
+                    payload["event"] = "under_attack"
+                    payload["attacker"] = ev.attacker
+                    self.notifier.alert(
+                        f"🚨 {ev.character} UNDER ATTACK - {ev.attacker}",
+                        f"{ev.kind}\n{body}", payload)
             if isinstance(ev, HoldFullEvent):
                 c = self.engine.char(ev.character)
                 if not c.notified:
