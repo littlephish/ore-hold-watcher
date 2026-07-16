@@ -80,6 +80,14 @@ Alerts fire once per crossing and re-arm after a reset, a compression, or
 when the fill drops 5% below the threshold. **Send test alert** sends the
 real current fleet state through every enabled method.
 
+An idle alert can also be enabled on the Alerts tab (on by default): if a
+pilot who was mining stops receiving ore ticks for X minutes (5 by
+default), you get one alert such as "⏸ Edgar Hendar - no ore ticks for 6
+min" through the same methods below. It re-arms when that pilot mines
+again, and it never fires at startup for pilots who already stopped before
+the app launched. Use it to catch depleted belts, returned drones, or a
+client that got bumped or disconnected.
+
 Each method is a checkbox on the Alerts tab, saved in `settings.json`:
 
 - **Pop-up**: native Windows toast (tray balloon as fallback). Obeys Focus

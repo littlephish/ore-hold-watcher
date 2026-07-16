@@ -268,6 +268,10 @@ class CharacterState:
     anchor_m3: float = 0.0
     # rolling (epoch, m3) mining events for rate/ETA; not persisted
     rate_events: deque = field(default_factory=deque)
+    # idle alert arming: starts True (disarmed) so startup replay of old
+    # logs can't fire it; a recent live mining tick arms it (False), going
+    # idle fires once and disarms again until mining resumes
+    idle_notified: bool = True
 
     def mining_rate_m3_min(self, now_epoch: float | None = None) -> float:
         """Current mining speed in m3/min over the rolling window;

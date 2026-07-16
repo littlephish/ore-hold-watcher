@@ -33,7 +33,8 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox,
                                QSystemTrayIcon, QVBoxLayout, QWidget,
                                QCheckBox)
 
-from engine import Engine, MiningEvent, HoldFullEvent, UnknownOreEvent
+from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
+                    ts_to_epoch)
 
 APP_NAME = "Ore Hold Watcher"
 ORG_DIR = "OreHoldWatcher"
@@ -190,6 +191,8 @@ DEFAULT_SETTINGS = {
     "always_on_top": False,
     "compressed_leaves_hold": True,  # you drag compressed ore to fleet hangar
     "alert_interval_min": 5.0,  # at most one alert per X minutes (0 = every alert)
+    "idle_alert_enabled": True,  # alert when a pilot stops receiving ore ticks
+    "idle_alert_min": 5.0,       # ... for this many minutes
     # --- auto-close before EVE daily downtime (cluster shutdown 11:00 UTC) ---
     "close_before_downtime": False,       # OFF by default
     "close_minutes_before": 5.0,          # force-close X min before shutdown
@@ -204,6 +207,7 @@ DEFAULT_SETTINGS = {
     "notify_ntfy": False,      # push to your phone via ntfy.sh
     "ntfy_topic": "",
     "hide_idle_hours": 12,   # hide chars with no activity for this long (0 = never hide)
+    "window_size": [560, 500],  # remembered across runs
     "mining_patterns": [],    # optional custom regexes; empty = built-in defaults
 }
 
@@ -281,7 +285,17 @@ QHeaderView::section {
     padding: 4px 6px; font-weight: 700;
 }
 QPushButton:hover { background: #6d6f78; }
-QScrollArea { border: none; }
+QScrollArea { border: none; background: transparent; }
+QScrollArea > QWidget > QWidget { background: #2b2d31; }
+QScrollBar:vertical, QScrollBar:horizontal {
+    background: #2b2d31; border: none; width: 10px; height: 10px;
+}
+QScrollBar::handle {
+    background: #4e5058; border-radius: 5px; min-height: 24px; min-width: 24px;
+}
+QScrollBar::handle:hover { background: #6d6f78; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 QMenu { background: #2b2d31; border: 1px solid #1e1f22; }
 QMenu::item:selected { background: #404249; }
 """
@@ -526,6 +540,11 @@ class CharRow(QWidget):
         self.chip.setObjectName("pctChip")
         self.lbl = QLabel(name)
         self.lbl.setObjectName("charName")
+        self.arm = QLabel("")
+        self.arm.setObjectName("pctChip")
+        self.arm.setToolTip("Idle-alert status: armed = watching for a stop "
+                            "in ore ticks; idle = ticks stopped (alert "
+                            "sent); standby = no live ticks yet")
         self.amount = QLabel("")
         self.amount.setObjectName("amount")
         self.bar = QProgressBar()
@@ -538,6 +557,7 @@ class CharRow(QWidget):
         top.addWidget(self.dot)
         top.addWidget(self.chip)
         top.addWidget(self.lbl)
+        top.addWidget(self.arm)
         top.addStretch(1)
         top.addWidget(self.amount)
 
@@ -547,11 +567,27 @@ class CharRow(QWidget):
         lay.addLayout(top)
         lay.addWidget(self.bar)
 
-    def update_state(self, est: float, cap: float, eta_s: float | None = None):
+    ARM_STYLES = {
+        "armed":   ("⛏ armed",  "#23a55a"),
+        "idle":    ("⏸ idle",   "#f0b232"),
+        "standby": ("standby",  "#6d6f78"),
+    }
+
+    def update_state(self, est: float, cap: float, eta_s: float | None = None,
+                     arm_state: str | None = None):
         pct = 100.0 * est / cap if cap else 0.0
         col = fill_color(pct)
         self.dot.setStyleSheet(f"color: {col}; font-size: 14px;")
         self.chip.setText(f"{pct:.1f}%")
+        if arm_state in self.ARM_STYLES:
+            txt, acol = self.ARM_STYLES[arm_state]
+            self.arm.setText(txt)
+            self.arm.setStyleSheet(
+                f"background: #1e1f22; color: {acol}; border-radius: 4px; "
+                f"padding: 1px 6px; font-size: 11px; font-weight: 700;")
+            self.arm.setVisible(True)
+        else:
+            self.arm.setVisible(False)
         txt = f"~{est:,.0f} / {cap:,.0f} m³"
         if eta_s is not None:
             txt += f"  ·  ⏳ {fmt_eta(eta_s)}"
@@ -689,6 +725,14 @@ class SettingsDialog(DarkDialog):
                                  "(0 = alert on every crossing)")
         self.interval.setValue(float(settings["alert_interval_min"]))
 
+        self.idle_on = QCheckBox("Alert when a pilot stops receiving ore ticks")
+        self.idle_on.setChecked(bool(settings["idle_alert_enabled"]))
+        self.idle_min = QDoubleSpinBox()
+        self.idle_min.setRange(1, 240)
+        self.idle_min.setDecimals(1)
+        self.idle_min.setSuffix(" min")
+        self.idle_min.setValue(float(settings["idle_alert_min"]))
+
         self.m_popup = QCheckBox("Pop-up notification (Windows toast)")
         self.m_popup.setChecked(bool(settings["notify_popup"]))
         self.m_overlay = QCheckBox("On-screen overlay banner alert")
@@ -746,6 +790,8 @@ class SettingsDialog(DarkDialog):
         al = QWidget()
         af = QFormLayout(al)
         af.addRow("Min. time between alerts:", self.interval)
+        af.addRow(self.idle_on)
+        af.addRow("Idle after:", self.idle_min)
         af.addRow(self.m_popup)
         af.addRow(self.m_overlay)
         af.addRow(self.m_sound)
@@ -794,6 +840,8 @@ class SettingsDialog(DarkDialog):
         self.s["threshold_pct"] = self.threshold.value()
         self.s["default_capacity"] = self.capacity.value()
         self.s["alert_interval_min"] = self.interval.value()
+        self.s["idle_alert_enabled"] = self.idle_on.isChecked()
+        self.s["idle_alert_min"] = self.idle_min.value()
         self.s["close_before_downtime"] = self.dt_close.isChecked()
         self.s["close_minutes_before"] = self.dt_lead.value()
         self.s["notify_popup"] = self.m_popup.isChecked()
@@ -853,7 +901,11 @@ class MainWindow(QMainWindow):
         )
 
         self.setWindowTitle(APP_NAME)
-        self.resize(430, 480)
+        try:
+            w_px, h_px = self.settings["window_size"]
+            self.resize(max(460, int(w_px)), max(320, int(h_px)))
+        except Exception:
+            self.resize(560, 500)
         self.apply_on_top()
 
         central = QWidget()
@@ -963,6 +1015,8 @@ class MainWindow(QMainWindow):
             self.activateWindow()
 
     def closeEvent(self, ev):  # close -> minimize to tray
+        self.settings["window_size"] = [self.width(), self.height()]
+        self.settings.save()
         ev.ignore()
         self.hide()
         self.tray.showMessage(APP_NAME, "Still watching in the tray. "
@@ -1130,7 +1184,14 @@ class MainWindow(QMainWindow):
         events = self.engine.poll()
         threshold = float(self.settings["threshold_pct"])
         rearm = threshold - float(self.settings["rearm_margin_pct"])
+        idle_after = max(60.0, float(self.settings["idle_alert_min"]) * 60.0)
+        now_utc = time.time()
         for ev in events:
+            # a LIVE mining tick (not startup replay of old lines) arms the
+            # idle alert for that pilot
+            if (isinstance(ev, MiningEvent) and
+                    now_utc - ts_to_epoch(ev.ts) < idle_after):
+                self.engine.char(ev.character).idle_notified = False
             if isinstance(ev, HoldFullEvent):
                 c = self.engine.char(ev.character)
                 if not c.notified:
@@ -1149,6 +1210,16 @@ class MainWindow(QMainWindow):
                 self.request_alert(f"⚠ {c.name} - {c.pct:.1f}% full")
             elif c.pct < rearm and c.notified:
                 c.notified = False
+        # idle detection: armed pilots whose ticks stopped for idle_after
+        if self.settings["idle_alert_enabled"]:
+            for c in self.engine.chars.values():
+                if c.idle_notified or not c.rate_events:
+                    continue
+                gap = now_utc - c.rate_events[-1][0]
+                if gap >= idle_after:
+                    c.idle_notified = True   # fire once until mining resumes
+                    self.request_alert(
+                        f"⏸ {c.name} - no ore ticks for {int(gap // 60)} min")
         self._flush_alert()          # send any alert the rate limiter held back
         self._check_downtime_close()
         self.refresh()
@@ -1177,7 +1248,15 @@ class MainWindow(QMainWindow):
             frame, row = self.rows[c.name]
             self.rows_box.removeWidget(frame)
             self.rows_box.insertWidget(i, frame)
-            row.update_state(c.est_m3, c.capacity, c.eta_full_s())
+            if not self.settings["idle_alert_enabled"]:
+                arm = None
+            elif not c.idle_notified:
+                arm = "armed"
+            elif c.rate_events:
+                arm = "idle"
+            else:
+                arm = "standby"
+            row.update_state(c.est_m3, c.capacity, c.eta_full_s(), arm)
 
         # who fills up first at current mining rates?
         etas = [(c.eta_full_s(), c) for c in chars]
