@@ -204,6 +204,8 @@ DEFAULT_SETTINGS = {
     "notify_sound": True,      # built-in system ding
     "notify_webhook": False,   # HTTP POST (Discord webhook URLs auto-detected)
     "webhook_url": "",
+    "discord_mention": "everyone",  # "everyone" | "custom" | "none"
+    "discord_mention_id": "",       # user ID, @here, or <@&roleID> when custom
     "notify_ntfy": False,      # push to your phone via ntfy.sh
     "ntfy_topic": "",
     "hide_idle_hours": 12,   # hide chars with no activity for this long (0 = never hide)
@@ -261,12 +263,25 @@ QPushButton {
     background: #4e5058; border: none; border-radius: 4px;
     padding: 5px 12px; color: #fff;
 }
-QLineEdit, QDoubleSpinBox, QSpinBox {
+QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {
     background: #ffffff; color: #000000;
     border: 1px solid #1e1f22; border-radius: 4px; padding: 3px 6px;
     selection-background-color: #5865f2; selection-color: #ffffff;
 }
 QLineEdit::placeholder { color: #6d6f78; }
+QComboBox QAbstractItemView {
+    background: #1e1f22; color: #dbdee1;
+    border: 1px solid #404249; border-radius: 4px; outline: none;
+    selection-background-color: #5865f2; selection-color: #ffffff;
+}
+QComboBox QAbstractItemView::item {
+    color: #dbdee1; background: #1e1f22; padding: 5px 8px;
+}
+QComboBox QAbstractItemView::item:hover,
+QComboBox QAbstractItemView::item:selected {
+    color: #ffffff; background: #5865f2;
+}
+QComboBox::drop-down { border: none; width: 22px; }
 QCheckBox { spacing: 8px; }
 QTabWidget::pane { border: 1px solid #1e1f22; border-radius: 4px; }
 QTabBar::tab {
@@ -471,7 +486,8 @@ class Notifier:
         url = str(self.s["webhook_url"]).strip()
         try:
             if "discord.com/api/webhooks" in url or "discordapp.com/api/webhooks" in url:
-                data = self._discord_body(title, body, payload)
+                data = self._discord_body(title, body, payload,
+                                          mention=self._mention_string())
             else:
                 data = {"title": title, "message": body, **payload}
             status = _post_json(url, data)
@@ -479,8 +495,23 @@ class Notifier:
         except Exception as e:
             log.warning("webhook failed: %s", e)
 
+    def _mention_string(self) -> str:
+        """Build the Discord mention from settings. '' = no ping."""
+        mode = str(self.s["discord_mention"]).lower()
+        if mode == "none":
+            return ""
+        if mode == "custom":
+            raw = str(self.s["discord_mention_id"]).strip()
+            if not raw:
+                return ""
+            if raw.isdigit():
+                return f"<@{raw}>"          # numeric user ID -> real ping
+            return raw                       # @here, <@&roleID>, etc. as-is
+        return "@everyone"
+
     @staticmethod
-    def _discord_body(title: str, body: str, payload: dict) -> dict:
+    def _discord_body(title: str, body: str, payload: dict,
+                      mention: str = "@everyone") -> dict:
         """Discord embed: one line per character with a status dot,
         embed color = worst character's state."""
         chars = (payload or {}).get("characters")
@@ -504,10 +535,12 @@ class Notifier:
         else:
             desc = body
             color = 0xF0B232
-        return {"content": "@everyone",
-                "embeds": [{"title": title, "description": desc[:4000],
+        data = {"embeds": [{"title": title, "description": desc[:4000],
                             "color": color,
                             "footer": {"text": "Ore Hold Watcher"}}]}
+        if mention:
+            data["content"] = mention
+        return data
 
     def _ntfy(self, title: str, body: str):
         topic = str(self.s["ntfy_topic"]).strip().lstrip("/")
@@ -743,6 +776,32 @@ class SettingsDialog(DarkDialog):
         self.m_webhook.setChecked(bool(settings["notify_webhook"]))
         self.webhook_url = QLineEdit(str(settings["webhook_url"]))
         self.webhook_url.setPlaceholderText("https://discord.com/api/webhooks/…")
+        from PySide6.QtWidgets import QComboBox
+        self.mention = QComboBox()
+        self.mention.addItem("@everyone", "everyone")
+        self.mention.addItem("Specific user / role / @here", "custom")
+        self.mention.addItem("No ping (embed only)", "none")
+        from PySide6.QtGui import QBrush, QPalette
+        from PySide6.QtWidgets import QStyledItemDelegate
+        # the default combo delegate ignores QSS ::item rules; this one obeys
+        self.mention.setItemDelegate(QStyledItemDelegate(self.mention))
+        for i in range(self.mention.count()):  # some styles ignore popup QSS
+            self.mention.setItemData(i, QBrush(QColor("#dbdee1")),
+                                     Qt.ForegroundRole)
+            self.mention.setItemData(i, QBrush(QColor("#1e1f22")),
+                                     Qt.BackgroundRole)
+        view = self.mention.view()
+        pal = view.palette()
+        pal.setColor(QPalette.Text, QColor("#dbdee1"))
+        pal.setColor(QPalette.Base, QColor("#1e1f22"))
+        pal.setColor(QPalette.Highlight, QColor("#5865f2"))
+        pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+        view.setPalette(pal)
+        idx = self.mention.findData(str(settings["discord_mention"]))
+        self.mention.setCurrentIndex(max(0, idx))
+        self.mention_id = QLineEdit(str(settings["discord_mention_id"]))
+        self.mention_id.setPlaceholderText(
+            "user ID (Developer Mode > Copy User ID), @here, or <@&roleID>")
         self.m_ntfy = QCheckBox("Phone push via ntfy.sh (free app, no account)")
         self.m_ntfy.setChecked(bool(settings["notify_ntfy"]))
         self.ntfy_topic = QLineEdit(str(settings["ntfy_topic"]))
@@ -797,6 +856,8 @@ class SettingsDialog(DarkDialog):
         af.addRow(self.m_sound)
         af.addRow(self.m_webhook)
         af.addRow("Webhook URL:", self.webhook_url)
+        af.addRow("Discord ping:", self.mention)
+        af.addRow("Ping target:", self.mention_id)
         af.addRow(self.m_ntfy)
         af.addRow("ntfy topic:", self.ntfy_topic)
         af.addRow(self.test_btn)
@@ -849,6 +910,8 @@ class SettingsDialog(DarkDialog):
         self.s["notify_sound"] = self.m_sound.isChecked()
         self.s["notify_webhook"] = self.m_webhook.isChecked()
         self.s["webhook_url"] = self.webhook_url.text().strip()
+        self.s["discord_mention"] = self.mention.currentData()
+        self.s["discord_mention_id"] = self.mention_id.text().strip()
         self.s["notify_ntfy"] = self.m_ntfy.isChecked()
         self.s["ntfy_topic"] = self.ntfy_topic.text().strip()
         self.s["always_on_top"] = self.ontop.isChecked()

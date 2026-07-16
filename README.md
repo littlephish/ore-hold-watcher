@@ -145,9 +145,12 @@ webhooks):
    click "Send test alert". The fleet digest should land in the channel
    within a second or two.
 
-Two things to know. First, the alert pings `@everyone` in that channel,
-which on a personal server is just you; if you put it on a shared server,
-pick a channel where the fleet actually wants pings. Second, treat the URL
+Two things to know. First, the "Discord ping" dropdown in Settings
+controls who gets pinged: `@everyone` (default), a specific target, or no
+ping at all (the embed still posts). For a specific person, enable
+Developer Mode in Discord (User Settings, Advanced), right-click the user,
+Copy User ID, and paste the number into the "Ping target" field; `@here`
+or a role mention like `<@&roleID>` also work there. Second, treat the URL
 like a password: anyone who has it can post to your channel, no login
 needed. If it leaks, delete or regenerate the webhook on the same
 Integrations page and paste the new URL into Settings.
