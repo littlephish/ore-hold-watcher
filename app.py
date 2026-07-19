@@ -194,6 +194,7 @@ DEFAULT_SETTINGS = {
     "poll_seconds": 2,
     "lookback_hours": 24,
     "always_on_top": False,
+    "privacy_mode": False,   # hide folder path + anonymize names (for sharing)
     "compressed_leaves_hold": True,  # you drag compressed ore to fleet hangar
     "alert_interval_min": 5.0,  # at most one alert per X minutes (0 = every alert)
     "idle_alert_enabled": True,  # alert when a pilot stops receiving ore ticks
@@ -1242,6 +1243,9 @@ class LedgerDialog(DarkDialog):
         super().__init__(main)
         self.main = main
         self.setWindowTitle("Daily mining ledger")
+        if main.settings["privacy_mode"]:   # stable aliases across all history
+            main.seed_aliases(c for day in main.engine.ledger["days"].values()
+                              for c in day)
         from PySide6.QtWidgets import QComboBox, QTreeWidget
 
         self.day_combo = QComboBox()
@@ -1433,11 +1437,14 @@ class LedgerDialog(DarkDialog):
         # name for stability); everyone else folds into "Other"
         top = sorted(sorted(char_totals, key=char_totals.get, reverse=True)[:8],
                      key=str.lower)
-        series = top + (["Other"] if len(char_totals) > len(top) else [])
+        # display names (aliased in privacy mode); "Other" stays "Other"
+        dn = self.main.disp
+        series = [dn(c) for c in top] + (
+            ["Other"] if len(char_totals) > len(top) else [])
         values = {}
         for bkey in order:
             per = raw[bkey]
-            dd = {ch: per.get(ch, 0.0) for ch in top}
+            dd = {dn(ch): per.get(ch, 0.0) for ch in top}
             other = sum(v for ch, v in per.items() if ch not in top)
             if other:
                 dd["Other"] = other
@@ -1510,7 +1517,7 @@ class LedgerDialog(DarkDialog):
             c_isk = sum(v for v in vals if v is not None)
             partial = any(v is None for v in vals)
             parent = QTreeWidgetItem(
-                [char, f"{c_units:,}", f"{c_m3:,.0f}",
+                [self.main.disp(char), f"{c_units:,}", f"{c_m3:,.0f}",
                  fmt_isk(c_isk if not partial or c_isk else None)
                  + (" (partial)" if partial and c_isk else "")])
             f = bold_font(parent.font(0))
@@ -1743,6 +1750,9 @@ class SettingsDialog(DarkDialog):
 
         self.ontop = QCheckBox("Keep main window always on top of other windows")
         self.ontop.setChecked(bool(settings["always_on_top"]))
+        self.privacy = QCheckBox("Privacy mode for screenshots (hide folder "
+                                 "path, alias names to Pilot 1/2/…)")
+        self.privacy.setChecked(bool(settings["privacy_mode"]))
         self.comp_out = QCheckBox("Compressed ore is moved out of the ore hold\n"
                                   "(compression frees the full raw volume)")
         self.comp_out.setChecked(bool(settings["compressed_leaves_hold"]))
@@ -1780,6 +1790,7 @@ class SettingsDialog(DarkDialog):
         gf.addRow("Alert threshold:", self.threshold)
         gf.addRow("Default ore hold capacity:", cap_row)
         gf.addRow(self.ontop)
+        gf.addRow(self.privacy)
         gf.addRow(self.comp_out)
         gf.addRow(self.cwatch)
         gf.addRow(self.ledger_on)
@@ -1827,9 +1838,17 @@ class SettingsDialog(DarkDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
 
+        notice = QLabel(
+            'EVE Online and the EVE logo are trademarks of CCP hf. This app '
+            'is not affiliated with or endorsed by CCP. '
+            '© CCP hf. All rights reserved.')
+        notice.setWordWrap(True)
+        notice.setStyleSheet("color: #6d6f78; font-size: 10px;")
+
         root = QVBoxLayout(self)
         root.addWidget(tabs)
         root.addWidget(bb)
+        root.addWidget(notice)
         self.setMinimumWidth(520)
 
     def show_hold_sizes(self):
@@ -1865,6 +1884,7 @@ class SettingsDialog(DarkDialog):
         self.s["notify_ntfy"] = self.m_ntfy.isChecked()
         self.s["ntfy_topic"] = self.ntfy_topic.text().strip()
         self.s["always_on_top"] = self.ontop.isChecked()
+        self.s["privacy_mode"] = self.privacy.isChecked()
         self.s["compressed_leaves_hold"] = self.comp_out.isChecked()
         self.s["client_watch_enabled"] = self.cwatch.isChecked()
         self.s["ledger_enabled"] = self.ledger_on.isChecked()
@@ -2020,6 +2040,37 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.tick)
         self.timer.start(int(float(self.settings["poll_seconds"]) * 1000))
         self.tick()
+
+    # -- privacy / display helpers -------------------------------------------
+    _aliases: dict = {}
+
+    def seed_aliases(self, names) -> None:
+        """Assign an alias to any not-yet-seen character. Append-only so an
+        existing alias never changes mid-render (which caused collisions);
+        seeding the full roster in sorted order gives Pilot 1..N by name."""
+        for n in sorted(set(names), key=str.lower):
+            if n not in self._aliases:
+                self._aliases[n] = f"Pilot {len(self._aliases) + 1}"
+
+    def disp(self, name: str) -> str:
+        """Character name for display. In privacy mode, a stable alias
+        (Pilot 1, Pilot 2, …); alerts and webhooks still use real names."""
+        if not self.settings["privacy_mode"]:
+            return name
+        if name not in self._aliases:
+            self.seed_aliases([name])
+        return self._aliases[name]
+
+    def disp_path(self, path) -> str:
+        """Watched-folder path for display; masked in privacy mode."""
+        s = str(path)
+        if not self.settings["privacy_mode"]:
+            return s
+        for marker in ("\\EVE\\", "/EVE/"):
+            i = s.find(marker)
+            if i >= 0:
+                return "…" + s[i:]
+        return "…\\Gamelogs"
 
     # -- helpers -------------------------------------------------------------
     def apply_on_top(self):
@@ -2426,6 +2477,8 @@ class MainWindow(QMainWindow):
     def refresh(self):
         chars = sorted(self.engine.chars.values(),
                        key=lambda c: c.pct, reverse=True)
+        if self.settings["privacy_mode"]:   # stable Pilot 1..N by real name
+            self.seed_aliases(c.name for c in chars)
         wanted = [c.name for c in chars]
         # drop rows for removed chars
         for name in list(self.rows):
@@ -2459,6 +2512,7 @@ class MainWindow(QMainWindow):
                 arm = "idle"
             else:
                 arm = "standby"
+            row.lbl.setText(self.disp(c.name))
             row.update_state(c.est_m3, c.capacity, c.eta_full_s(), arm)
 
         # who fills up first at current mining rates?
@@ -2470,10 +2524,10 @@ class MainWindow(QMainWindow):
         dir_ok = self.engine.log_dir.is_dir()
         parts = []
         if first_full:
-            parts.append(f"⏳ First hold full: {first_full[1].name} in "
-                         f"~{fmt_eta(first_full[0])}")
+            parts.append(f"⏳ First hold full: {self.disp(first_full[1].name)} "
+                         f"in ~{fmt_eta(first_full[0])}")
         parts += [f"{'Watching' if dir_ok else '⚠ MISSING FOLDER'}: "
-                 f"{self.engine.log_dir}",
+                 f"{self.disp_path(self.engine.log_dir)}",
                  f"{len(self.engine.files)} log files · "
                  f"{s['lines']:,} lines · {s['mining_events']:,} mining · "
                  f"{s['compress_events']} compressions"]
@@ -2498,7 +2552,7 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(APP_NAME)
         def tip_line(c):
             eta = c.eta_full_s()
-            return (f"{c.pct:.1f}%  {c.name}" +
+            return (f"{c.pct:.1f}%  {self.disp(c.name)}" +
                     (f"  ({fmt_eta(eta)})" if eta else ""))
         tip = "\n".join(tip_line(c) for c in chars[:8]) or APP_NAME
         self.tray.setToolTip(tip)
