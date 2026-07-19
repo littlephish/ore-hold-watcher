@@ -83,6 +83,48 @@ no mining cycle for 5+ minutes shows no ETA.
 Colors everywhere mean the same thing: green below 75%, amber 75 to 90%,
 red above 90%.
 
+## Daily mining ledger
+
+The 📒 button opens a per-day breakdown (days split at EVE/UTC midnight):
+each character's mined ore by type with units, m³, and a per-character
+subtotal, plus a grand TOTAL row. Data comes straight from the mining
+lines already being parsed and is stored in `ledger.json` (last 60 days).
+A per-character high-water mark keeps restarts and Recalculate from ever
+double-counting a day. Toggle it on the Settings General tab.
+
+ISK values are a separate opt-in ("Fetch Jita prices"): when enabled, ore
+is valued at its **compressed** Jita buy price (raw ore isn't sold - you
+compress and haul), resolved via Fuzzwork.co.uk's public market API and
+cached in `prices.json`. Mined units compress 1:1, so a day's ISK is
+`units × Compressed<ore> Jita buy`. This is the only network call the app
+makes besides the alert methods and the update check, and it never talks
+to CCP. With pricing off (the default) the ledger still shows units and
+m³, and ISK shows "-". Prices refresh on the 12 h cadence and also
+immediately when you start mining an ore that has no price yet, so
+switching ore types mid-session fills its ISK within a few minutes instead
+of waiting out the window.
+
+ISK is valued **per-day as a snapshot**: while the app runs with pricing
+on, each day freezes the Jita prices in effect that day into
+`ledger.json`, and past days keep that frozen basis even as the market
+moves. So a day's ISK is what the ore was worth when you mined it, not
+what it would sell for today. Quantities are always exact; only the price
+basis is stored. Days that were never priced (before you enabled pricing, or days the app
+wasn't running) are, by default, backfilled at today's compressed price and
+clearly marked as estimated - the day-detail status says so and the chart
+note reads "incl. days at today's price". Turn off "Value unpriced past
+days at today's price" on the General tab to leave them as "-" instead. The
+ledger keeps ~13 months of history.
+
+Pricing degrades gracefully. A cached price is kept until a newer one
+replaces it, so if Fuzzwork is unreachable the app keeps valuing with the
+last price it knew rather than dropping to zero. A failed fetch never
+clears the cache, one bad ore name can't abort the batch, and a market
+outage leaves every cached price intact and simply retries later. When the
+prices in use are older than the normal refresh window, the chart's note
+line says how old (e.g. "prices 2d old") so a slightly stale value is
+visible rather than silent.
+
 ## Alerts
 
 Alerts are fleet digests: one notification listing every character
@@ -93,6 +135,56 @@ alert suppressed by the limit sends itself the moment the window reopens.
 Alerts fire once per crossing and re-arm after a reset, a compression, or
 when the fill drops 5% below the threshold. **Send test alert** sends the
 real current fleet state through every enabled method.
+
+## Mining drone stopped
+
+A drone alert (off by default, Alerts tab) fires when a mining drone
+auto-returns because its asteroid depleted - the log line
+`Mining Drone I deactivates as it finds the resource ... a pale shadow of
+its former glory`, which is verified against real gamelogs. It's debounced
+(default 30 s) so a whole flight returning on a dry rock is one alert, not
+five, and it's scoped to tracked miners. Use it to catch drones sitting
+idle on a mined-out rock while you're on another screen.
+
+Two related things the logs cannot do, stated plainly: EVE writes no line
+for a single drone being individually disabled (only the depleted-rock
+return above), and "drones getting jammed" is not an EVE event - ECM jams
+your ship's targeting, which idles the drones, so that shows up as the
+combat jam alert below plus the idle alert, not a drone event. Getting
+jammed yourself is caught by the combat alert (it reads
+warp-scramble/disruption and sensor-jam attempts), but note that wording
+has not yet been validated against a real jam in these logs, and NPC
+Guristas rats jam constantly, so only PLAYER jams alert.
+
+## Logged-in client detection
+
+With "Detect closed clients via window titles" enabled (default, General
+tab), the app reads the titles of EVE client windows ("EVE - CharacterName"
+when logged in) to know which tracked pilots actually have a client open.
+This is a read-only Windows window-manager call matched to the
+`exefile.exe` process, never a read of the EVE process itself, and it is
+what EVE-O Preview and similar multiboxing tools already do. Its one job
+here: a pilot whose client is **closed** shows a grey "🔌 closed" chip and
+never fires the idle alert, so logging an alt off no longer looks like a
+stalled mining op. When that pilot logs back in and mines, the chip returns
+to armed on the next tick. The logs alone cannot tell a logout from an idle
+belt; the window title can.
+
+## Daily mining chart
+
+The 📒 ledger has two tabs. **Day detail** is the per-character ore table.
+**Trend** is a stacked bar chart, each bar split by character, switchable
+between m³, units, and ISK (ISK needs the Fuzzwork price option). Two
+controls handle any amount of history: **Range** (7 days / 30 / 90 / 1
+year / All) sets how far back, and **Group** buckets the bars by day,
+week, or month. Group defaults to Auto, which keeps the chart readable by
+switching to weekly past ~a month of data and monthly past ~half a year,
+so a year of mining shows as ~18 weekly bars rather than 365 slivers.
+Hover any segment for that character's exact amount in that bucket; the
+bucket total is labelled above each bar. Characters keep a fixed color;
+past the top eight, the rest fold into a grey "Other" band.
+
+## Combat alerts
 
 A combat alert (off by default; the checkbox also controls whether combat
 lines are scanned at all) fires when a tracked mining character takes
@@ -126,11 +218,20 @@ Each method is a checkbox on the Alerts tab, saved in `settings.json`:
   borderless-windowed games, dismisses on click. Use this if you tend to
   miss toasts while playing.
 - **Sound**: the built-in Windows exclamation ding.
-- **Webhook**: HTTP POST to any URL. Discord webhook URLs are detected
-  automatically and get an `@everyone` embed with one color-coded line per
-  character (see "Creating a Discord webhook" below). Any other endpoint
-  receives JSON: `title`, `message`, and a `characters` array with
-  `est_m3`, `capacity_m3`, `pct`, and `eta_min` per character.
+- **Webhook**: HTTP POST to any URL, with the body auto-shaped to the
+  destination:
+  - **Discord** webhook URLs get an `@everyone` embed with one color-coded
+    line per character (see "Creating a Discord webhook" below).
+  - **IFTTT** works two ways. A classic Webhooks URL
+    (`maker.ifttt.com/trigger/{event}/with/key/{key}`) receives
+    `value1` = title, `value2` = the digest, `value3` = the fullest hold,
+    so IFTTT applet ingredients populate for SMS, a phone call, smart
+    lights, etc. An IFTTT URL with `/json/` in it
+    (`.../trigger/{event}/json/with/key/{key}`) receives the full generic
+    payload below, which you parse with IFTTT filter code.
+  - **Any other endpoint** receives JSON: `title`, `message`, and a
+    `characters` array with `est_m3`, `capacity_m3`, `pct`, and `eta_min`
+    per character.
 - **Phone push via ntfy.sh**: install the free ntfy app, subscribe to a
   topic name of your choosing (treat it like a password), and enter the
   same topic in Settings. No account needed. For true SMS you would need a

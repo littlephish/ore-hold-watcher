@@ -99,6 +99,12 @@ HOLD_FULL_MARKERS = (
 # lines that look like mining but must NOT be counted
 EXCLUDE_MARKERS = ("residue", "wasted", "lost")
 
+# "(notify) Mining Drone I deactivates as it finds the resource it was
+# harvesting a pale shadow of its former glory."  Verified in real logs:
+# a mining drone auto-returned because its asteroid depleted.
+DRONE_STOP_RE = re.compile(
+    r"Mining Drone.*deactivates as it finds the resource", re.IGNORECASE)
+
 # --- combat (being attacked) ---
 # Incoming damage after tag-strip: "287 from Attacker - Smashes"
 COMBAT_DMG_RE = re.compile(
@@ -141,6 +147,12 @@ class UnknownOreEvent:
     character: str
     ore: str
     qty: int
+
+
+@dataclass
+class DroneStopEvent:
+    character: str
+    ts: str
 
 
 @dataclass
@@ -334,7 +346,9 @@ class Engine:
                  lookback_hours: float = 24.0,
                  default_capacity: float = 180000.0,
                  compressed_leaves_hold: bool = True,
-                 combat_enabled: bool = True):
+                 combat_enabled: bool = True,
+                 ledger_path: Path | None = None,
+                 ledger_enabled: bool = False):
         self.log_dir = Path(log_dir)
         self.state_path = Path(state_path)
         self.lookback_hours = lookback_hours
@@ -347,6 +361,19 @@ class Engine:
         # when False, (combat) lines are skipped at the parser level -
         # no combat scanning happens at all
         self.combat_enabled = combat_enabled
+        self.drone_enabled = False   # scan (notify) for mining-drone stops
+        # daily mining ledger: per UTC day, per character, units by ore.
+        # "marks" holds a per-character high-water log timestamp so replays
+        # (restart, Recalculate) never double-count into the ledger.
+        self.ledger_enabled = ledger_enabled
+        self.ledger_path = Path(ledger_path) if ledger_path else None
+        # days:   day -> char -> ore -> units mined (ground truth)
+        # prices: day -> ore -> Jita buy price FROZEN for that day (a value
+        #         snapshot; quantities stay exact, only the ISK basis is
+        #         stored so past days keep their worth-when-mined)
+        # marks:  char -> high-water log ts (replay-safe accrual)
+        self.ledger = {"marks": {}, "days": {}, "prices": {}}
+        self._load_ledger()
         self.table = OreTable(ore_override_path)
         pats = mining_patterns or DEFAULT_MINING_PATTERNS
         self.patterns = [re.compile(p, re.IGNORECASE) for p in pats]
@@ -394,6 +421,57 @@ class Engine:
             self.state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except OSError:
             pass
+
+    # -- ledger ---------------------------------------------------------------
+    def _load_ledger(self):
+        if not (self.ledger_path and self.ledger_path.exists()):
+            return
+        try:
+            data = json.loads(self.ledger_path.read_text(encoding="utf-8"))
+            if isinstance(data.get("days"), dict):
+                self.ledger = {"marks": dict(data.get("marks", {})),
+                               "days": data["days"],
+                               "prices": dict(data.get("prices", {}))}
+        except Exception as e:
+            log.warning("ledger load failed: %s", e)
+
+    def snapshot_prices(self, day: str, price_map: dict) -> bool:
+        """Freeze the given day's ISK price basis. Overwrites only the day
+        passed (callers pass today), so past days stay frozen. Returns True
+        if anything changed."""
+        if not price_map:
+            return False
+        clean = {o: float(p) for o, p in price_map.items() if p}
+        if self.ledger["prices"].get(day) == clean:
+            return False
+        self.ledger["prices"][day] = clean
+        return True
+
+    def save_ledger(self):
+        if not self.ledger_path:
+            return
+        days = self.ledger["days"]
+        keep = set(sorted(days)[-400:])   # ~13 months of history
+        for old in [d for d in days if d not in keep]:
+            days.pop(old, None)
+        for old in [d for d in self.ledger["prices"] if d not in keep]:
+            self.ledger["prices"].pop(old, None)
+        try:
+            self.ledger_path.write_text(
+                json.dumps(self.ledger, indent=1), encoding="utf-8")
+        except OSError as e:
+            log.warning("ledger save failed: %s", e)
+
+    def _ledger_add(self, ev: MiningEvent) -> bool:
+        mark = self.ledger["marks"].get(ev.character, "")
+        if mark and ev.ts <= mark:
+            return False                # already counted (replay)
+        day = ev.ts[:10]                # "YYYY.MM.DD" (UTC == EVE time)
+        per_char = self.ledger["days"].setdefault(day, {})
+        ores_d = per_char.setdefault(ev.character, {})
+        ores_d[ev.ore] = ores_d.get(ev.ore, 0) + ev.qty
+        self.ledger["marks"][ev.character] = ev.ts
+        return True
 
     # -- character helpers ---------------------------------------------------
     def char(self, name: str) -> CharacterState:
@@ -490,7 +568,11 @@ class Engine:
             self._last_scan = now
         events: list = []
         dirty = False
-        for lf in list(self.files.values()):
+        ledger_dirty = False
+        # filenames start with the session timestamp; sorted order keeps a
+        # character's events chronological so the ledger high-water mark
+        # can't skip an older file ingested after a newer one
+        for lf in sorted(self.files.values(), key=lambda f: f.path.name):
             lines = lf.read_new_lines()
             if not lines:
                 continue
@@ -505,8 +587,11 @@ class Engine:
                 # skipping them makes startup replay idempotent.
                 # CombatEvents skip this: they must not create character
                 # rows (a non-mining alt getting shot is not fleet cargo)
+                # CombatEvent and DroneStopEvent are transient signals, not
+                # cargo - they never create rows or pass the anchor filter
                 ev_ts = getattr(ev, "ts", None)
-                if ev_ts is not None and not isinstance(ev, CombatEvent):
+                if (ev_ts is not None and
+                        not isinstance(ev, (CombatEvent, DroneStopEvent))):
                     c = self.char(ev.character)
                     if c.anchor_ts and ev_ts <= c.anchor_ts:
                         continue
@@ -516,6 +601,8 @@ class Engine:
                     self.stats["mining_events"] += 1
                     log.debug("mining: %s +%d %s = %.1f m3",
                               ev.character, ev.qty, ev.ore, ev.m3)
+                    if self.ledger_enabled and self._ledger_add(ev):
+                        ledger_dirty = True
                     c = self.char(ev.character)
                     c.est_m3 += ev.m3
                     c.last_event = now
@@ -546,6 +633,8 @@ class Engine:
                     c.unknown_ores[ev.ore] = c.unknown_ores.get(ev.ore, 0) + ev.qty
         if dirty:
             self.save_state()
+        if ledger_dirty:
+            self.save_ledger()
         return events
 
     def _parse_line(self, character: str, line: str):
@@ -561,6 +650,9 @@ class Engine:
         low = msg.lower()
         if channel == "notify" and any(k in low for k in HOLD_FULL_MARKERS):
             return HoldFullEvent(character=character, ts=m.group("ts"))
+        if (channel == "notify" and self.drone_enabled and
+                DRONE_STOP_RE.search(msg)):
+            return DroneStopEvent(character=character, ts=m.group("ts"))
         cm = COMPRESS_RE.search(msg)
         if cm:
             qty = parse_qty(cm.group("qty"))

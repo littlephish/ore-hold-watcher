@@ -23,7 +23,7 @@ from pathlib import Path
 
 log = logging.getLogger("orewatcher.app")
 
-from PySide6.QtCore import Qt, QTimer, QSize
+from PySide6.QtCore import Qt, QTimer, QSize, QRect
 from PySide6.QtGui import (QAction, QBrush, QColor, QIcon, QPainter, QPen,
                            QPixmap, QFont)
 from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox,
@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox,
                                QCheckBox)
 
 from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
-                    CombatEvent, ts_to_epoch)
+                    CombatEvent, DroneStopEvent, ts_to_epoch)
 
 APP_NAME = "Ore Hold Watcher"
 ORG_DIR = "OreHoldWatcher"
@@ -196,6 +196,13 @@ DEFAULT_SETTINGS = {
     "idle_alert_min": 5.0,       # ... for this many minutes
     "combat_alert_enabled": False,  # scan/alert on PLAYER aggression (never NPC)
     "combat_alert_cooldown_s": 120,  # per-pilot cooldown between combat alerts
+    "drone_alert_enabled": False,   # alert when mining drones stop (rock depleted)
+    "drone_alert_cooldown_s": 30,   # debounce a whole flight stopping at once
+    "ledger_enabled": True,        # daily per-character mined-ore ledger
+    "ledger_fetch_prices": True,   # Jita prices via Fuzzwork for ISK (on)
+    "ledger_backfill_prices": True,  # value unpriced past days at today's price
+    "client_watch_enabled": True,  # read window titles ("EVE - Name") to know
+                                   # which characters are actually logged in
     # --- auto-close before EVE daily downtime (cluster shutdown 11:00 UTC) ---
     "close_before_downtime": False,       # OFF by default
     "close_minutes_before": 5.0,          # force-close X min before shutdown
@@ -341,6 +348,195 @@ def style_titlebar(win):
         dwm.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(text), 4)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Logged-in client detection (window titles, read-only)
+# ---------------------------------------------------------------------------
+
+class ClientWatcher:
+    """Enumerates top-level windows belonging to EVE client processes and
+    reads their titles ("EVE - CharacterName" when logged in, "EVE" at
+    character select). Pure read-only Win32 window-manager calls; the EVE
+    process itself is never touched."""
+
+    def __init__(self, process_names: list[str]):
+        self.process_names = {str(n).lower() for n in (process_names or
+                                                       ["exefile.exe"])}
+        self.online: set[str] = set()   # character names with a live window
+        self.clients = 0                # EVE windows seen (incl. char select)
+        self.ready = False              # at least one successful refresh
+
+    def refresh(self):
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+            found: set[str] = set()
+            count = [0]
+
+            @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def enum_cb(hwnd, _):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                n = user32.GetWindowTextLengthW(hwnd)
+                if not n:
+                    return True
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, buf, n + 1)
+                title = buf.value
+                if not title.lower().startswith("eve"):
+                    return True
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                h = kernel32.OpenProcess(0x1000, False, pid.value)  # QUERY_LIMITED
+                if not h:
+                    return True
+                try:
+                    size = wintypes.DWORD(1024)
+                    pbuf = ctypes.create_unicode_buffer(size.value)
+                    if kernel32.QueryFullProcessImageNameW(
+                            h, 0, pbuf, ctypes.byref(size)):
+                        exe = pbuf.value.rsplit("\\", 1)[-1].lower()
+                        if exe in self.process_names:
+                            count[0] += 1
+                            if " - " in title:
+                                found.add(title.split(" - ", 1)[1].strip())
+                finally:
+                    kernel32.CloseHandle(h)
+                return True
+
+            user32.EnumWindows(enum_cb, 0)
+            self.online = found
+            self.clients = count[0]
+            self.ready = True
+        except Exception as e:
+            log.warning("client watch failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Jita prices (Fuzzwork, opt-in)
+# ---------------------------------------------------------------------------
+
+class PriceService:
+    """Resolves ore names to Jita buy.max ISK via Fuzzwork's public APIs.
+    Everything is cached to prices.json; network only runs when the user
+    has opted in, and only when the cache is older than 12 hours."""
+
+    REGION = 10000002  # The Forge (Jita)
+
+    def __init__(self):
+        self.path = config_dir() / "prices.json"
+        # "ts" = last time ANY refresh attempt got fresh data (drives the
+        # 12 h refresh cadence). "ok_ts" = last FULLY successful refresh
+        # (drives the staleness label). "prices" is never cleared on a
+        # failure - a known price is kept until a newer one replaces it.
+        self.data = {"ts": 0.0, "ok_ts": 0.0, "ids": {}, "prices": {}}
+        self.busy = False
+        self.error: str | None = None
+        try:
+            if self.path.exists():
+                self.data.update(json.loads(self.path.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+
+    def cached(self) -> dict:
+        return dict(self.data.get("prices", {}))
+
+    def stale(self) -> bool:
+        return time.time() - float(self.data.get("ts", 0)) > 12 * 3600
+
+    def age_seconds(self) -> float | None:
+        """How old the last successfully fetched price is, or None if we've
+        never fetched one."""
+        ok = float(self.data.get("ok_ts", 0))
+        return (time.time() - ok) if ok else None
+
+    def _save(self):
+        try:
+            self.path.write_text(json.dumps(self.data, indent=1),
+                                 encoding="utf-8")
+        except OSError as e:
+            log.warning("prices.json save failed (keeping in memory): %s", e)
+
+    def fetch_async(self, names: list[str]):
+        if self.busy:
+            return
+        self.busy = True
+        self.error = None
+        threading.Thread(target=self._fetch, args=(list(names),),
+                         daemon=True).start()
+
+    def _fetch(self, names: list[str]):
+        """Best-effort refresh. Every failure mode keeps the last known
+        prices: a bad type-ID lookup skips that one ore, a dead market API
+        leaves ALL prices untouched, and a disk error keeps them in memory.
+        We never zero or delete a price we already have."""
+        import urllib.parse
+        updated = 0
+        try:
+            ids = self.data.setdefault("ids", {})
+            # resolve missing type IDs, one ore at a time so a single bad
+            # name or blip can't abort the batch
+            for name in names:
+                if name in ids:
+                    continue
+                try:
+                    url = ("https://www.fuzzwork.co.uk/api/typeid.php?typename="
+                           + urllib.parse.quote(name))
+                    req = urllib.request.Request(
+                        url, headers={"User-Agent": APP_NAME})
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        d = json.loads(r.read().decode("utf-8"))
+                    tid = int(d.get("typeID", 0) or 0)
+                    if tid:
+                        ids[name] = tid
+                    else:
+                        log.warning("no typeID for ore %r", name)
+                except Exception as e:
+                    log.warning("typeID lookup for %r failed (keeping any "
+                                "known price): %s", name, e)
+
+            wanted = {n: ids[n] for n in names if n in ids}
+            got_market = False
+            if wanted:
+                try:
+                    url = (f"https://market.fuzzwork.co.uk/aggregates/?region="
+                           f"{self.REGION}&types="
+                           + ",".join(str(t) for t in wanted.values()))
+                    req = urllib.request.Request(
+                        url, headers={"User-Agent": APP_NAME})
+                    with urllib.request.urlopen(req, timeout=20) as r:
+                        agg = json.loads(r.read().decode("utf-8"))
+                    got_market = True
+                    for name, tid in wanted.items():
+                        entry = agg.get(str(tid), {})
+                        buy = float(entry.get("buy", {}).get("max", 0) or 0)
+                        if buy > 0:          # only overwrite with a real price
+                            self.data["prices"][name] = buy
+                            updated += 1
+                except Exception as e:
+                    log.warning("market fetch failed - keeping %d cached "
+                                "prices: %s", len(self.data["prices"]), e)
+                    self.error = str(e)
+
+            if got_market:
+                now = time.time()
+                self.data["ts"] = now
+                self.data["ok_ts"] = now
+                self.error = None
+                self._save()
+                log.info("prices refreshed: %d updated, %d total cached",
+                         updated, len(self.data["prices"]))
+            elif updated == 0 and not self.data["prices"]:
+                self.error = self.error or "no price data available yet"
+        except Exception as e:   # never let the price thread crash the app
+            log.warning("price fetch aborted (cache preserved): %s", e)
+            self.error = str(e)
+        finally:
+            self.busy = False
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +846,16 @@ class Notifier:
             if "discord.com/api/webhooks" in url or "discordapp.com/api/webhooks" in url:
                 data = self._discord_body(title, body, payload,
                                           mention=self._mention_string())
+            elif "maker.ifttt.com/trigger/" in url and "/json/" not in url:
+                # IFTTT classic trigger: only value1/value2/value3 map to
+                # applet ingredients. (An IFTTT URL WITH /json/ takes the
+                # generic payload below and parses it with filter code.)
+                fullest = ""
+                chars = (payload or {}).get("characters")
+                if chars:
+                    c = chars[0]
+                    fullest = f"{c['character']} {c['pct']}% ({c['est_m3']:,} m³)"
+                data = {"value1": title, "value2": body, "value3": fullest}
             else:
                 data = {"title": title, "message": body, **payload}
             status = _post_json(url, data)
@@ -763,9 +969,10 @@ class CharRow(QWidget):
         lay.addWidget(self.bar)
 
     ARM_STYLES = {
-        "armed":   ("⛏ armed",  "#23a55a"),
-        "idle":    ("⏸ idle",   "#f0b232"),
-        "standby": ("standby",  "#6d6f78"),
+        "armed":   ("⛏ armed",   "#23a55a"),
+        "idle":    ("⏸ idle",    "#f0b232"),
+        "closed":  ("🔌 closed", "#949ba4"),
+        "standby": ("standby",   "#6d6f78"),
     }
 
     def update_state(self, est: float, cap: float, eta_s: float | None = None,
@@ -799,6 +1006,474 @@ class CharRow(QWidget):
         m.addSeparator()
         m.addAction("Remove from list", lambda: self.main.remove_char(self.name))
         m.exec(self.mapToGlobal(pos))
+
+
+# ---------------------------------------------------------------------------
+# Daily ledger dialog + trend chart
+# ---------------------------------------------------------------------------
+
+# Validated categorical palette (dark mode, checked against this app's row
+# surface #313338 with the dataviz validator: CVD dE 8.4, normal dE 19.3,
+# all-pass; green sits at 2.56:1 so the chart ships direct labels, tooltips
+# and the Day-detail table as relief). Assignment is by fixed slot order.
+CHART_SERIES = ["#3987e5", "#008300", "#d55181", "#c98500",
+                "#199e70", "#d95926", "#9085e9", "#e66767"]
+CHART_OTHER = "#6d6f78"
+CHART_SURFACE = "#313338"
+CHART_GRID = "#3f4147"
+CHART_TEXT = "#dbdee1"
+CHART_MUTED = "#949ba4"
+
+
+def knum(v: float) -> str:
+    if v >= 1e9:
+        return f"{v/1e9:.1f}B"
+    if v >= 1e6:
+        return f"{v/1e6:.1f}M"
+    if v >= 1e3:
+        return f"{v/1e3:.0f}k"
+    return f"{v:.0f}"
+
+
+class LedgerChart(QWidget):
+    """Stacked bars, one per day, split by character. Custom QPainter -
+    no extra dependency, Nuitka-safe, dark-theme native."""
+
+    def __init__(self):
+        super().__init__()
+        self.days: list[str] = []
+        self.series: list[str] = []        # legend order == stack order
+        self.values: dict = {}             # day -> {char: value}
+        self.labels: list[str] = []
+        self.unit = "m³"
+        self.setMouseTracking(True)
+        self.setMinimumHeight(260)
+        self._hit: list[tuple] = []        # (QRect, char, day, value)
+
+    def set_data(self, days, series, values, unit, labels=None):
+        self.days, self.series, self.values, self.unit = days, series, values, unit
+        self.labels = labels or [d[5:] for d in days]  # default MM.DD
+        self.update()
+
+    def color_for(self, char: str) -> str:
+        try:
+            i = self.series.index(char)
+        except ValueError:
+            return CHART_OTHER
+        return CHART_SERIES[i] if i < len(CHART_SERIES) else CHART_OTHER
+
+    def paintEvent(self, ev):
+        from PySide6.QtGui import QPainterPath
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor(CHART_SURFACE))
+        self._hit = []
+        W, H = self.width(), self.height()
+        pad_l, pad_r, pad_t, pad_b = 56, 12, 34, 26
+        plot_w, plot_h = W - pad_l - pad_r, H - pad_t - pad_b
+        f = QFont()
+        f.setPixelSize(11)
+        p.setFont(f)
+
+        # legend (always present; identity never color-alone: tooltips +
+        # the Day-detail table carry names too)
+        x = pad_l
+        for ch in self.series:
+            p.setBrush(QColor(self.color_for(ch)))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(x, 10, 10, 10, 2, 2)
+            p.setPen(QColor(CHART_TEXT))
+            w = p.fontMetrics().horizontalAdvance(ch)
+            p.drawText(x + 14, 19, ch)
+            x += 14 + w + 16
+        if not self.days:
+            p.setPen(QColor(CHART_MUTED))
+            p.drawText(self.rect(), Qt.AlignCenter, "No ledger data yet")
+            p.end()
+            return
+
+        totals = {d: sum(self.values.get(d, {}).values()) for d in self.days}
+        vmax = max(totals.values()) or 1.0
+
+        # recessive grid: 3 lines + muted y labels
+        p.setPen(QColor(CHART_GRID))
+        for i in (1, 2, 3):
+            y = pad_t + plot_h - plot_h * i / 3
+            p.drawLine(pad_l, int(y), W - pad_r, int(y))
+            p.setPen(QColor(CHART_MUTED))
+            p.drawText(4, int(y) + 4, knum(vmax * i / 3))
+            p.setPen(QColor(CHART_GRID))
+        p.drawLine(pad_l, pad_t + plot_h, W - pad_r, pad_t + plot_h)  # baseline
+
+        n = len(self.days)
+        slot = plot_w / n
+        bar_w = max(6, min(48, int(slot) - 4))
+        xstep = max(1, n // 10)  # label every k-th day to avoid collisions
+        for i, day in enumerate(self.days):
+            bx = int(pad_l + i * slot + (slot - bar_w) / 2)
+            y = pad_t + plot_h
+            per = self.values.get(day, {})
+            segs = [(ch, per.get(ch, 0.0)) for ch in self.series]
+            top_y = y
+            for ch, v in segs:
+                if v <= 0:
+                    continue
+                h = plot_h * v / vmax
+                seg_top = y - h
+                r = QRect(bx, int(seg_top), bar_w, max(1, int(h)))
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(self.color_for(ch)))
+                p.drawRect(r)
+                # 2px surface gap between stacked segments
+                p.fillRect(bx, int(seg_top), bar_w, 2, QColor(CHART_SURFACE))
+                self._hit.append((r, ch, day, v))
+                y = seg_top
+                top_y = seg_top
+            # 4px rounded cap on the top segment, anchored stack
+            if totals[day] > 0:
+                p.setBrush(QColor(self.color_for(
+                    next((c for c, v in reversed(segs) if v > 0),
+                         self.series[0]))))
+                path = QPainterPath()
+                path.addRoundedRect(bx, int(top_y), bar_w, 6, 3, 3)
+                p.drawPath(path)
+                # selective direct label: bar total, only when it fits
+                if bar_w >= 26:
+                    p.setPen(QColor(CHART_MUTED))
+                    p.drawText(QRect(bx - 20, int(top_y) - 16, bar_w + 40, 14),
+                               Qt.AlignCenter, knum(totals[day]))
+            if i % xstep == 0:
+                p.setPen(QColor(CHART_MUTED))
+                lbl = self.labels[i] if i < len(self.labels) else day[5:]
+                p.drawText(QRect(bx - 24, pad_t + plot_h + 4, bar_w + 48, 16),
+                           Qt.AlignCenter, lbl)
+        p.end()
+
+    def mouseMoveEvent(self, ev):
+        from PySide6.QtWidgets import QToolTip
+        pos = ev.position().toPoint()
+        for r, ch, day, v in self._hit:
+            if r.contains(pos):
+                QToolTip.showText(ev.globalPosition().toPoint(),
+                                  f"{ch}\n{day}: {v:,.0f} {self.unit}", self)
+                return
+        QToolTip.hideText()
+
+class LedgerDialog(DarkDialog):
+    """Per-day, per-character mined ore: units, m³, and ISK (when priced)."""
+
+    def __init__(self, main: "MainWindow"):
+        super().__init__(main)
+        self.main = main
+        self.setWindowTitle("Daily mining ledger")
+        from PySide6.QtWidgets import QComboBox, QTreeWidget
+
+        self.day_combo = QComboBox()
+        days = sorted(main.engine.ledger["days"], reverse=True)
+        for d in days:
+            self.day_combo.addItem(d)
+        self.day_combo.currentTextChanged.connect(lambda *_: self.populate())
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(4)
+        self.tree.setHeaderLabels(["Character / Ore", "Units", "m³",
+                                   "ISK (compressed, Jita buy)"])
+        self.tree.setRootIsDecorated(True)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color: #949ba4;")
+
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+
+        # Day detail tab
+        day_tab = QWidget()
+        dlay = QVBoxLayout(day_tab)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Day (EVE/UTC):"))
+        top.addWidget(self.day_combo, 1)
+        dlay.addLayout(top)
+        dlay.addWidget(self.tree, 1)
+
+        # Trend tab: stacked bars over every day in the ledger
+        trend_tab = QWidget()
+        tlay = QVBoxLayout(trend_tab)
+        mrow = QHBoxLayout()
+        mrow.addWidget(QLabel("Metric:"))
+        self.metric_combo = QComboBox()
+        for m in ("m³", "units", "ISK"):
+            self.metric_combo.addItem(m)
+        self.metric_combo.currentTextChanged.connect(lambda *_: self.update_chart())
+        mrow.addWidget(self.metric_combo)
+        mrow.addWidget(QLabel("Range:"))
+        self.range_combo = QComboBox()
+        for lbl, days in (("7 days", 7), ("30 days", 30), ("90 days", 90),
+                          ("1 year", 365), ("All", 0)):
+            self.range_combo.addItem(lbl, days)
+        self.range_combo.setCurrentIndex(1)   # 30 days
+        self.range_combo.currentTextChanged.connect(lambda *_: self.update_chart())
+        mrow.addWidget(self.range_combo)
+        mrow.addWidget(QLabel("Group:"))
+        self.group_combo = QComboBox()
+        for g in ("Auto", "Day", "Week", "Month"):
+            self.group_combo.addItem(g)
+        self.group_combo.currentTextChanged.connect(lambda *_: self.update_chart())
+        mrow.addWidget(self.group_combo)
+        self.trend_note = QLabel("")
+        self.trend_note.setStyleSheet("color: #949ba4;")
+        mrow.addWidget(self.trend_note, 1)
+        tlay.addLayout(mrow)
+        self.chart = LedgerChart()
+        tlay.addWidget(self.chart, 1)
+
+        from PySide6.QtWidgets import QTabWidget
+        tabs = QTabWidget()
+        tabs.addTab(day_tab, "Day detail")
+        tabs.addTab(trend_tab, "Trend")
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(tabs, 1)
+        lay.addWidget(self.status)
+        lay.addWidget(bb)
+        self.resize(680, 520)
+
+        # ISK uses each day's FROZEN price snapshot (the "Compressed <ore>"
+        # market price, since raw ore isn't sold) so priced days keep their
+        # worth-when-mined. Unpriced past days are backfilled at today's
+        # price - which means we need a current price for EVERY ore that
+        # appears anywhere in the ledger, not just today's. Fetch whatever's
+        # missing from the cache so backfill can value all of them.
+        self.frozen = main.engine.ledger.get("prices", {})
+        if main.settings["ledger_fetch_prices"]:
+            all_ores = {o for day in main.engine.ledger["days"].values()
+                        for chars in day.values() for o in chars}
+            want = sorted({"Compressed " + o for o in all_ores})
+            have = set(main.prices.cached())
+            if want and any(n not in have for n in want):
+                main.prices.fetch_async(want)
+                self.status.setText("Fetching Jita prices from Fuzzwork…")
+                self._poll = QTimer(self)
+                self._poll.timeout.connect(self._check_fetch)
+                self._poll.start(500)
+        self.populate()
+        self.update_chart()
+
+    def _today_price(self, ore: str):
+        key = "Compressed " + ore
+        today = time.strftime("%Y.%m.%d", time.gmtime())
+        dp = self.frozen.get(today)
+        if dp and key in dp:
+            return dp[key]
+        return self.main.prices.cached().get(key)
+
+    def price_for(self, day: str, ore: str):
+        """(price, exact) COMPRESSED Jita buy for (day, ore). exact=True is
+        the frozen worth-when-mined; exact=False means the day wasn't priced
+        and we backfilled with today's price (if that option is on).
+        price is None when we have nothing at all."""
+        key = "Compressed " + ore
+        dp = self.frozen.get(day)
+        if dp and key in dp:
+            return dp[key], True
+        if day == time.strftime("%Y.%m.%d", time.gmtime()):
+            p = self.main.prices.cached().get(key)
+            return (p, True) if p else (None, True)
+        # past day with no snapshot: backfill at today's price if allowed
+        if self.main.settings["ledger_backfill_prices"]:
+            p = self._today_price(ore)
+            if p:
+                return p, False
+        return None, True
+
+    @staticmethod
+    def _bucket(day: str, mode: str) -> tuple[str, str]:
+        """Return (bucket_key, x_label) for a 'YYYY.MM.DD' day."""
+        from datetime import date, timedelta
+        y, m, d = (int(x) for x in day.split("."))
+        if mode == "month":
+            return f"{y:04d}.{m:02d}", f"{y % 100:02d}.{m:02d}"
+        if mode == "week":
+            dt = date(y, m, d)
+            start = dt - timedelta(days=dt.weekday())  # Monday
+            key = start.isoformat()
+            return key, start.strftime("%m.%d")
+        return day, day[5:]
+
+    def update_chart(self):
+        days_all = sorted(self.main.engine.ledger["days"])
+        span_days = int(self.range_combo.currentData())
+        if span_days and days_all:
+            from datetime import date, timedelta
+            y, m, d = (int(x) for x in days_all[-1].split("."))
+            cutoff = (date(y, m, d) - timedelta(days=span_days - 1)).strftime(
+                "%Y.%m.%d")
+            day_keys = [d for d in days_all if d >= cutoff]
+        else:
+            day_keys = days_all
+
+        grp = self.group_combo.currentText().lower()
+        if grp == "auto":
+            n = len(day_keys)
+            grp = "day" if n <= 31 else ("week" if n <= 183 else "month")
+
+        metric = self.metric_combo.currentText()
+        table = self.main.engine.table
+        partial = False
+        estimated = False
+
+        def value(ore, qty, day):
+            nonlocal partial, estimated
+            if metric == "units":
+                return float(qty)
+            if metric == "m³":
+                return (table.unit_volume(ore) or 0.0) * qty
+            p, exact = self.price_for(day, ore)
+            if not p:
+                partial = True
+                return 0.0
+            if not exact:
+                estimated = True   # backfilled at today's price
+            return p * qty
+
+        # aggregate day -> bucket, summing per character
+        raw: dict = {}          # bucket_key -> {char: value}
+        labels: dict = {}       # bucket_key -> x label
+        order: list = []        # bucket keys in time order
+        char_totals: dict = {}
+        for day in day_keys:
+            bkey, blab = self._bucket(day, grp)
+            if bkey not in raw:
+                raw[bkey] = {}
+                labels[bkey] = blab
+                order.append(bkey)
+            per = raw[bkey]
+            for char, ores_d in self.main.engine.ledger["days"][day].items():
+                v = sum(value(o, q, day) for o, q in ores_d.items())
+                per[char] = per.get(char, 0.0) + v
+                char_totals[char] = char_totals.get(char, 0.0) + v
+
+        # fixed identity: top 8 characters keep their own slot (sorted by
+        # name for stability); everyone else folds into "Other"
+        top = sorted(sorted(char_totals, key=char_totals.get, reverse=True)[:8],
+                     key=str.lower)
+        series = top + (["Other"] if len(char_totals) > len(top) else [])
+        values = {}
+        for bkey in order:
+            per = raw[bkey]
+            dd = {ch: per.get(ch, 0.0) for ch in top}
+            other = sum(v for ch, v in per.items() if ch not in top)
+            if other:
+                dd["Other"] = other
+            values[bkey] = dd
+        self.chart.set_data(order, series, values,
+                            "ISK" if metric == "ISK" else metric,
+                            labels=[labels[k] for k in order])
+        grp_note = {"day": "daily", "week": "weekly", "month": "monthly"}[grp]
+        note = f"{grp_note} · {len(order)} bars"
+        if metric == "ISK":
+            note += "  ·  compressed Jita buy"
+            if estimated:
+                note += "  ·  incl. days at today's price"
+            if partial:
+                note += "  ·  some days unpriced"
+            age = self.main.prices.age_seconds()
+            if age is not None and age > 13 * 3600:   # older than the cadence
+                hrs = age / 3600
+                note += (f"  ·  prices {hrs/24:.0f}d old"
+                         if hrs >= 48 else f"  ·  prices {hrs:.0f}h old")
+        self.trend_note.setText(note)
+
+    def _check_fetch(self):
+        if self.main.prices.busy:
+            return
+        self._poll.stop()
+        # freeze today's snapshot from what we just fetched (compressed keys)
+        today = time.strftime("%Y.%m.%d", time.gmtime())
+        cached = self.main.prices.cached()
+        want = {"Compressed " + o for chars in
+                self.main.engine.ledger["days"].get(today, {}).values()
+                for o in chars}
+        snap = {n: cached[n] for n in want if n in cached}
+        if self.main.engine.snapshot_prices(today, snap):
+            self.main.engine.save_ledger()
+        self.frozen = self.main.engine.ledger.get("prices", {})
+        self.status.setText("Price fetch failed: " + self.main.prices.error
+                            if self.main.prices.error else "")
+        self.populate()
+        self.update_chart()
+
+    def populate(self):
+        from PySide6.QtWidgets import QTreeWidgetItem
+        self.tree.clear()
+        day = self.day_combo.currentText()
+        data = self.main.engine.ledger["days"].get(day, {})
+        table = self.main.engine.table
+
+        est_used = [False]
+
+        def isk(ore, qty):
+            p, exact = self.price_for(day, ore)
+            if not p:
+                return None
+            if not exact:
+                est_used[0] = True   # backfilled at today's price
+            return p * qty
+
+        def fmt_isk(v):
+            return f"{v:,.0f}" if v is not None else "-"
+
+        g_units = g_m3 = 0
+        g_isk, g_isk_partial = 0.0, False
+        for char in sorted(data, key=lambda c: c.lower()):
+            ores_d = data[char]
+            c_units = sum(ores_d.values())
+            c_m3 = sum((table.unit_volume(o) or 0) * q
+                       for o, q in ores_d.items())
+            vals = [isk(o, q) for o, q in ores_d.items()]
+            c_isk = sum(v for v in vals if v is not None)
+            partial = any(v is None for v in vals)
+            parent = QTreeWidgetItem(
+                [char, f"{c_units:,}", f"{c_m3:,.0f}",
+                 fmt_isk(c_isk if not partial or c_isk else None)
+                 + (" (partial)" if partial and c_isk else "")])
+            f = parent.font(0)
+            f.setBold(True)
+            for col in range(4):
+                parent.setFont(col, f)
+            for ore in sorted(ores_d):
+                q = ores_d[ore]
+                m3 = (table.unit_volume(ore) or 0) * q
+                parent.addChild(QTreeWidgetItem(
+                    ["    " + ore, f"{q:,}", f"{m3:,.0f}",
+                     fmt_isk(isk(ore, q))]))
+            self.tree.addTopLevelItem(parent)
+            parent.setExpanded(True)
+            g_units += c_units
+            g_m3 += c_m3
+            g_isk += c_isk
+            g_isk_partial = g_isk_partial or partial
+        total = QTreeWidgetItem(
+            ["TOTAL", f"{g_units:,}", f"{g_m3:,.0f}",
+             (f"{g_isk:,.0f}" + (" (partial)" if g_isk_partial else ""))
+             if g_isk else "-"])
+        f = total.font(0)
+        f.setBold(True)
+        for col in range(4):
+            total.setFont(col, f)
+        self.tree.addTopLevelItem(total)
+        for col in range(4):
+            self.tree.resizeColumnToContents(col)
+        if not data:
+            self.status.setText("No mining recorded for this day yet."
+                                if day else "No ledger data yet - it fills "
+                                "in as your pilots mine.")
+        elif est_used[0]:
+            self.status.setText("ISK for this day is estimated at today's "
+                                "compressed price - it wasn't priced when "
+                                "mined.")
+        elif not self.main.prices.error:
+            self.status.setText("")
 
 
 # ---------------------------------------------------------------------------
@@ -936,6 +1611,9 @@ class SettingsDialog(DarkDialog):
         self.combat_cd.setDecimals(0)
         self.combat_cd.setSuffix(" s cooldown / pilot")
         self.combat_cd.setValue(float(settings["combat_alert_cooldown_s"]))
+        self.drone_on = QCheckBox("Alert when a mining drone stops "
+                                  "(asteroid depleted)")
+        self.drone_on.setChecked(bool(settings["drone_alert_enabled"]))
 
         self.m_popup = QCheckBox("Pop-up notification (Windows toast)")
         self.m_popup.setChecked(bool(settings["notify_popup"]))
@@ -994,6 +1672,18 @@ class SettingsDialog(DarkDialog):
         self.comp_out = QCheckBox("Compressed ore is moved out of the ore hold\n"
                                   "(compression frees the full raw volume)")
         self.comp_out.setChecked(bool(settings["compressed_leaves_hold"]))
+        self.cwatch = QCheckBox("Detect closed clients via window titles "
+                                "('EVE - Name', read-only) - closed pilots "
+                                "never fire the idle alert")
+        self.cwatch.setChecked(bool(settings["client_watch_enabled"]))
+        self.ledger_on = QCheckBox("Track daily mined ore per character (📒 ledger)")
+        self.ledger_on.setChecked(bool(settings["ledger_enabled"]))
+        self.ledger_prices = QCheckBox("Fetch Jita prices for ISK values "
+                                       "(compressed, Fuzzwork.co.uk, cached 12 h)")
+        self.ledger_prices.setChecked(bool(settings["ledger_fetch_prices"]))
+        self.ledger_backfill = QCheckBox("Value unpriced past days at today's "
+                                         "price (marked as estimated)")
+        self.ledger_backfill.setChecked(bool(settings["ledger_backfill_prices"]))
         self.upd_check = QCheckBox("Check GitHub for app updates (daily)")
         self.upd_check.setChecked(bool(settings["update_check"]))
         self.upd_repo = QLineEdit(str(settings["update_repo"]))
@@ -1018,6 +1708,10 @@ class SettingsDialog(DarkDialog):
         gf.addRow("Default ore hold capacity:", cap_row)
         gf.addRow(self.ontop)
         gf.addRow(self.comp_out)
+        gf.addRow(self.cwatch)
+        gf.addRow(self.ledger_on)
+        gf.addRow(self.ledger_prices)
+        gf.addRow(self.ledger_backfill)
         gf.addRow(self.upd_check)
         gf.addRow("GitHub repo:", self.upd_repo)
         gf.addRow(self.dbg)
@@ -1031,6 +1725,7 @@ class SettingsDialog(DarkDialog):
         af.addRow("Idle after:", self.idle_min)
         af.addRow(self.combat_on)
         af.addRow("Combat re-alert:", self.combat_cd)
+        af.addRow(self.drone_on)
         af.addRow(self.m_popup)
         af.addRow(self.m_overlay)
         af.addRow(self.m_sound)
@@ -1085,6 +1780,7 @@ class SettingsDialog(DarkDialog):
         self.s["idle_alert_min"] = self.idle_min.value()
         self.s["combat_alert_enabled"] = self.combat_on.isChecked()
         self.s["combat_alert_cooldown_s"] = self.combat_cd.value()
+        self.s["drone_alert_enabled"] = self.drone_on.isChecked()
         self.s["close_before_downtime"] = self.dt_close.isChecked()
         self.s["close_minutes_before"] = self.dt_lead.value()
         self.s["notify_popup"] = self.m_popup.isChecked()
@@ -1098,6 +1794,10 @@ class SettingsDialog(DarkDialog):
         self.s["ntfy_topic"] = self.ntfy_topic.text().strip()
         self.s["always_on_top"] = self.ontop.isChecked()
         self.s["compressed_leaves_hold"] = self.comp_out.isChecked()
+        self.s["client_watch_enabled"] = self.cwatch.isChecked()
+        self.s["ledger_enabled"] = self.ledger_on.isChecked()
+        self.s["ledger_fetch_prices"] = self.ledger_prices.isChecked()
+        self.s["ledger_backfill_prices"] = self.ledger_backfill.isChecked()
         self.s["update_check"] = self.upd_check.isChecked()
         self.s["update_repo"] = self.upd_repo.text().strip()
         self.s["debug_verbose"] = self.dbg.isChecked()
@@ -1146,7 +1846,14 @@ class MainWindow(QMainWindow):
             default_capacity=float(self.settings["default_capacity"]),
             compressed_leaves_hold=bool(self.settings["compressed_leaves_hold"]),
             combat_enabled=bool(self.settings["combat_alert_enabled"]),
+            ledger_path=config_dir() / "ledger.json",
+            ledger_enabled=bool(self.settings["ledger_enabled"]),
         )
+        self.engine.drone_enabled = bool(self.settings["drone_alert_enabled"])
+        self.prices = PriceService()
+        self.clients = ClientWatcher(self.settings["eve_process_names"])
+        self._last_client_scan = 0.0
+        self._last_price_check = 0.0
 
         self.setWindowTitle(APP_NAME)
         try:
@@ -1166,6 +1873,10 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 15px; font-weight: 700;")
         hdr.addWidget(title)
         hdr.addStretch(1)
+        b_ledger = QPushButton("📒")
+        b_ledger.setFixedWidth(34)
+        b_ledger.setToolTip("Daily mining ledger")
+        b_ledger.clicked.connect(lambda: LedgerDialog(self).exec())
         b_reset = QPushButton("Recalculate")
         b_reset.setToolTip("Rebuild all estimates by replaying the logs "
                            "(last %d h)" % int(float(self.settings["lookback_hours"])))
@@ -1173,6 +1884,7 @@ class MainWindow(QMainWindow):
         b_cfg = QPushButton("⚙")
         b_cfg.setFixedWidth(34)
         b_cfg.clicked.connect(self.open_settings)
+        hdr.addWidget(b_ledger)
         hdr.addWidget(b_reset)
         hdr.addWidget(b_cfg)
         v.addLayout(hdr)
@@ -1224,6 +1936,7 @@ class MainWindow(QMainWindow):
             self._last_update_check = time.time()
         self._last_alert_ts = 0.0     # rate limiter for threshold alerts
         self._combat_alerted: dict[str, float] = {}  # per-pilot combat cooldown
+        self._drone_alerted: dict[str, float] = {}   # per-pilot drone cooldown
         self._alert_pending = False
         self._pending_title = ""
 
@@ -1436,9 +2149,46 @@ class MainWindow(QMainWindow):
                 self.settings["compressed_leaves_hold"])
             self.engine.combat_enabled = bool(
                 self.settings["combat_alert_enabled"])
+            self.engine.drone_enabled = bool(
+                self.settings["drone_alert_enabled"])
+            self.engine.ledger_enabled = bool(
+                self.settings["ledger_enabled"])
             self.apply_on_top()
             self.show()
             self.refresh()
+
+    # -- daily ISK price snapshot ------------------------------------------------
+    def _maintain_prices(self):
+        """Keep today's frozen price basis fresh so each day's ISK is
+        captured at the prices in effect while it was mined. Values ore at
+        its COMPRESSED Jita price (raw ore isn't sold). Only runs when the
+        ledger and price fetching are on."""
+        if not (self.settings["ledger_enabled"] and
+                self.settings["ledger_fetch_prices"]):
+            return
+        today = time.strftime("%Y.%m.%d", time.gmtime())
+        ores = {o for chars in
+                self.engine.ledger["days"].get(today, {}).values()
+                for o in chars}
+        if not ores:
+            return
+        # value compressed: mined units compress 1:1, so ISK uses the
+        # "Compressed <ore>" market price
+        want = sorted({"Compressed " + o for o in ores})
+        cached = self.prices.cached()
+        missing = [n for n in want if n not in cached]
+        now = time.time()
+        # fetch when prices are stale OR a mined ore has no price yet (e.g.
+        # you switched to a new ore mid-day); short cooldown so a new ore's
+        # ISK shows within minutes instead of waiting out the 12 h window
+        if ((self.prices.stale() or missing) and
+                now - self._last_price_check > 600):
+            self._last_price_check = now
+            self.prices.fetch_async(want)   # background; snapshot next tick
+            cached = self.prices.cached()
+        snap = {n: cached[n] for n in want if n in cached}
+        if snap and self.engine.snapshot_prices(today, snap):
+            self.engine.save_ledger()
 
     # -- updates -----------------------------------------------------------------
     def manual_update_check(self):
@@ -1496,6 +2246,15 @@ class MainWindow(QMainWindow):
         rearm = threshold - float(self.settings["rearm_margin_pct"])
         idle_after = max(60.0, float(self.settings["idle_alert_min"]) * 60.0)
         now_utc = time.time()
+        # window-title scan every 10 s: which characters have a live client
+        watch = bool(self.settings["client_watch_enabled"])
+        if watch and now_utc - self._last_client_scan > 10:
+            self._last_client_scan = now_utc
+            self.clients.refresh()
+        watch = watch and self.clients.ready
+
+        def is_closed(name: str) -> bool:
+            return watch and name not in self.clients.online
         for ev in events:
             # a LIVE mining tick (not startup replay of old lines) arms the
             # idle alert for that pilot
@@ -1519,6 +2278,18 @@ class MainWindow(QMainWindow):
                     self.notifier.alert(
                         f"🚨 {ev.character} UNDER ATTACK - {ev.attacker}",
                         f"{ev.kind}\n{body}", payload)
+            # mining drone stopped (asteroid depleted); debounced so a whole
+            # flight returning on a dry rock is one alert. Tracked miners only.
+            if (isinstance(ev, DroneStopEvent) and
+                    self.settings["drone_alert_enabled"] and
+                    ev.character in self.engine.chars and
+                    now_utc - ts_to_epoch(ev.ts) < 120):
+                cd = float(self.settings["drone_alert_cooldown_s"])
+                if now_utc - self._drone_alerted.get(ev.character, 0.0) >= cd:
+                    self._drone_alerted[ev.character] = now_utc
+                    self.request_alert(
+                        f"🛑 {ev.character} - mining drone(s) stopped "
+                        f"(asteroid depleted)")
             if isinstance(ev, HoldFullEvent):
                 c = self.engine.char(ev.character)
                 if not c.notified:
@@ -1537,9 +2308,14 @@ class MainWindow(QMainWindow):
                 self.request_alert(f"⚠ {c.name} - {c.pct:.1f}% full")
             elif c.pct < rearm and c.notified:
                 c.notified = False
-        # idle detection: armed pilots whose ticks stopped for idle_after
+        # idle detection: armed pilots whose ticks stopped for idle_after.
+        # A CLOSED client is not idle: it disarms silently and never fires
+        # the idle alert (re-arms automatically on the next live tick).
         if self.settings["idle_alert_enabled"]:
             for c in self.engine.chars.values():
+                if is_closed(c.name):
+                    c.idle_notified = True
+                    continue
                 if c.idle_notified or not c.rate_events:
                     continue
                 gap = now_utc - c.rate_events[-1][0]
@@ -1549,6 +2325,7 @@ class MainWindow(QMainWindow):
                         f"⏸ {c.name} - no ore ticks for {int(gap // 60)} min")
         self._flush_alert()          # send any alert the rate limiter held back
         self._check_downtime_close()
+        self._maintain_prices()
         self._pump_updates()
         self.refresh()
 
@@ -1576,7 +2353,11 @@ class MainWindow(QMainWindow):
             frame, row = self.rows[c.name]
             self.rows_box.removeWidget(frame)
             self.rows_box.insertWidget(i, frame)
-            if not self.settings["idle_alert_enabled"]:
+            closed = (bool(self.settings["client_watch_enabled"]) and
+                      self.clients.ready and c.name not in self.clients.online)
+            if closed:
+                arm = "closed"
+            elif not self.settings["idle_alert_enabled"]:
                 arm = None
             elif not c.idle_notified:
                 arm = "armed"

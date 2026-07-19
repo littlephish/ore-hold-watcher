@@ -2,6 +2,8 @@
 settings.json
 state.json
 ores_override.json
+ledger.json
+prices.json
 debug.log
 debug.log.*
 .write_test
