@@ -1006,6 +1006,12 @@ class CharRow(QWidget):
         self.arm.setToolTip("Idle-alert status: armed = watching for a stop "
                             "in ore ticks; idle = ticks stopped (alert "
                             "sent); standby = no live ticks yet")
+        self.bump = QLabel('<a href="#" style="color:#f0b232;">⤴ resize</a>')
+        self.bump.setToolTip("This hold ran past its configured capacity - "
+                             "click to bump it to a larger ship size")
+        self.bump.setVisible(False)
+        self.bump.linkActivated.connect(
+            lambda *_: self.main.suggest_bump(self.name))
         self.amount = QLabel("")
         self.amount.setObjectName("amount")
         self.bar = QProgressBar()
@@ -1020,6 +1026,7 @@ class CharRow(QWidget):
         top.addWidget(self.lbl)
         top.addWidget(self.arm)
         top.addStretch(1)
+        top.addWidget(self.bump)
         top.addWidget(self.amount)
 
         lay = QVBoxLayout(self)
@@ -1054,6 +1061,11 @@ class CharRow(QWidget):
         if eta_s is not None:
             txt += f"  ·  ⏳ {fmt_eta(eta_s)}"
         self.amount.setText(txt)
+        # nudge: show "resize" only while the hold is over capacity BUT still
+        # within the ship class's max-skill size - past that it's estimate
+        # drift, not a too-small capacity, so stop nudging
+        smax = ship_max_hold(cap)
+        self.bump.setVisible(cap * 1.005 < est <= smax + 1)
         self.bar.setValue(int(min(pct, 100) * 10))
         self.bar.setStyleSheet(
             f"QProgressBar::chunk {{ background: {col}; border-radius: 4px; }}")
@@ -1579,6 +1591,15 @@ SHIP_ORE_HOLDS = [
     ("Orca",      150000, 187500, "Industrial Command Ships V"),
     ("Rorqual",   300000, 375000, "Capital Industrial Ships V"),
 ]
+
+
+def ship_max_hold(capacity: float) -> float:
+    """The max-skill hold size of the ship class a configured capacity most
+    likely belongs to: the smallest max-skill (level-V) value >= capacity.
+    Used to bound the 'resize' nudge - a hold over its own ship's max is
+    estimate drift, not a too-small capacity, so we stop nudging there."""
+    at_vs = sorted(v for _, _, v, _ in SHIP_ORE_HOLDS)
+    return next((a for a in at_vs if a >= capacity - 1), at_vs[-1])
 
 
 class OreHoldInfoDialog(DarkDialog):
@@ -2252,6 +2273,43 @@ class MainWindow(QMainWindow):
         if ok:
             self.engine.set_capacity(name, val)
             self.refresh()
+
+    def suggest_bump(self, name: str):
+        """The hold ran past its configured capacity. Offer to bump it to the
+        next standard ship hold size at or above the current estimate, or to
+        the estimate itself if it's already bigger than any standard size."""
+        c = self.engine.char(name)
+        # the max-skill size of this hold's ship class (what the nudge is
+        # bounded to); offer that as the bump target
+        target = ship_max_hold(c.capacity)
+        est_round = int(round(c.est_m3 / 500.0) * 500)   # tidy number
+        options = []
+        if target > c.capacity + 1:
+            ship = next((n for n, b, a, _ in SHIP_ORE_HOLDS if a == target), "")
+            options.append((f"{target:,.0f} m³  ({ship} max skill)",
+                            float(target)))
+        options.append((f"{est_round:,} m³  (current estimate)",
+                        float(est_round)))
+        options.append(("Choose a value…", None))
+
+        from PySide6.QtWidgets import QInputDialog
+        labels = [o[0] for o in options]
+        choice, ok = QInputDialog.getItem(
+            self, "Bump capacity",
+            f"{self.disp(name)}'s hold passed its {c.capacity:,.0f} m³ "
+            f"capacity (now ~{c.est_m3:,.0f} m³).\n"
+            "Set its capacity to:", labels, 0, False)
+        if not ok:
+            return
+        val = dict((o[0], o[1]) for o in options)[choice]
+        if val is None:
+            val, ok2 = QInputDialog.getDouble(
+                self, "Set capacity", f"Ore hold capacity for "
+                f"{self.disp(name)} (m³):", c.capacity, 1, 10_000_000, 0)
+            if not ok2:
+                return
+        self.engine.set_capacity(name, val)
+        self.refresh()
 
     def remove_char(self, name: str):
         self.engine.remove(name)
