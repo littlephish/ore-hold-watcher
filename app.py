@@ -39,6 +39,10 @@ from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
 
 APP_NAME = "Ore Hold Watcher"
 ORG_DIR = "OreHoldWatcher"
+DEFAULT_UPDATE_REPO = "littlephish/ore-hold-watcher"
+# Fallback version for source runs. The built exe carries the real version
+# stamped from the git tag by release.yml; that wins when available.
+APP_VERSION = "1.0.0"
 
 try:
     from winotify import Notification, audio  # Windows toasts
@@ -220,7 +224,8 @@ DEFAULT_SETTINGS = {
     "ntfy_topic": "",
     "hide_idle_hours": 12,   # hide chars with no activity for this long (0 = never hide)
     "update_check": True,    # check GitHub releases for a newer exe
-    "update_repo": "",       # "owner/repo" of this app on GitHub
+    "update_repo": "littlephish/ore-hold-watcher",  # GitHub owner/repo
+    "update_skip_version": "",  # a version the user chose to skip permanently
     "window_size": [560, 500],  # remembered across runs
     "mining_patterns": [],    # optional custom regexes; empty = built-in defaults
 }
@@ -583,6 +588,13 @@ def current_exe_version() -> str | None:
         return None
 
 
+def app_version_str() -> str:
+    """Displayable version: the exe's stamped version when built, else the
+    source fallback marked as such."""
+    v = current_exe_version()
+    return f"v{v}" if v else f"v{APP_VERSION} (source)"
+
+
 class Updater:
     """Checks GitHub releases, downloads the new exe, swaps it in place.
     Network work runs in daemon threads; the UI polls the fields."""
@@ -597,7 +609,10 @@ class Updater:
         self.manual = False
 
     def repo(self) -> str:
-        return str(self.s["update_repo"]).strip().strip("/")
+        # hardcoded default so updates work out of the box; a non-empty
+        # setting can still override it
+        return (str(self.s["update_repo"]).strip().strip("/")
+                or DEFAULT_UPDATE_REPO)
 
     def can_update(self) -> bool:
         return bool(self.repo()) and is_frozen() and sys.platform == "win32"
@@ -667,33 +682,77 @@ class Updater:
 
     # -- phase 3: swap + restart ---------------------------------------------
     def apply(self) -> bool:
-        """Write a swap script that waits for this process to exit, replaces
-        the exe, and relaunches it. Caller must quit right after."""
+        """Write a swap script that replaces the exe once it unlocks, then
+        relaunches it. Caller must quit right after.
+
+        Design notes (each fixes a real failure seen in the wild):
+        - No PID wait: a onefile exe's payload PID (os.getpid) isn't the
+          process holding the .exe lock, so waiting on it is unreliable.
+          Instead the script just retries `move` until the file is
+          replaceable - the lock releasing IS the "app has exited" signal.
+        - `ping` for delays, not `timeout`: `timeout` aborts without a
+          console.
+        - Launched with CREATE_BREAKAWAY_FROM_JOB so it escapes the job
+          object a onefile exe puts the app in - otherwise the script is
+          killed the instant the app closes (its job closes with it).
+        - Writes update-log.txt next to the exe so a failed swap is
+          diagnosable."""
         if not self.downloaded:
             return False
         import subprocess
         exe = sys.executable
+        new = self.downloaded
         bat = exe + ".update.bat"
-        pid = os.getpid()
-        with open(bat, "w", encoding="ascii") as f:
-            f.write(f"""@echo off
-:wait
-tasklist /fi "PID eq {pid}" 2>nul | find "{pid}" >nul
+        logf = exe + ".update-log.txt"
+        sleep1 = "ping -n 2 127.0.0.1 >nul"
+        script = f"""@echo off
+setlocal enableextensions
+set "LOG={logf}"
+echo [%date% %time%] updater started, replacing "{exe}" > "%LOG%"
+{sleep1}
+set /a tries=0
+:swap
+move /y "{new}" "{exe}" >>"%LOG%" 2>&1
 if not errorlevel 1 (
-    timeout /t 1 /nobreak >nul
-    goto wait
+    echo [%date% %time%] move succeeded after %tries% retries >> "%LOG%"
+    goto relaunch
 )
-move /y "{self.downloaded}" "{exe}" >nul
+set /a tries+=1
+if %tries% geq 60 (
+    echo [%date% %time%] gave up after %tries% retries; relaunching existing >> "%LOG%"
+    goto relaunch
+)
+{sleep1}
+goto swap
+:relaunch
+echo [%date% %time%] starting "{exe}" >> "%LOG%"
 start "" "{exe}"
+echo [%date% %time%] done >> "%LOG%"
 del "%~f0"
-""")
-        subprocess.Popen(
-            ["cmd", "/c", bat],
-            creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                           | getattr(subprocess, "DETACHED_PROCESS", 0)),
-            close_fds=True)
-        log.info("update swap script launched; exiting for replacement")
-        return True
+"""
+        try:
+            with open(bat, "w", encoding="ascii") as f:
+                f.write(script)
+        except OSError as e:
+            log.warning("could not write update script: %s", e)
+            return False
+
+        DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0x8)
+        NEWGROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+        BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x1000000)
+        launched = False
+        # try to break away from the onefile job object first; if the job
+        # forbids breakaway, CreateProcess errors - fall back without it
+        for flags in (DETACHED | NEWGROUP | BREAKAWAY, DETACHED | NEWGROUP):
+            try:
+                subprocess.Popen(["cmd", "/c", bat], creationflags=flags,
+                                 close_fds=True)
+                launched = True
+                log.info("update swap script launched (flags=0x%x)", flags)
+                break
+            except OSError as e:
+                log.warning("update launch failed (flags=0x%x): %s", flags, e)
+        return launched
 
 
 class DarkDialog(QDialog):
@@ -1023,6 +1082,23 @@ CHART_SURFACE = "#313338"
 CHART_GRID = "#3f4147"
 CHART_TEXT = "#dbdee1"
 CHART_MUTED = "#949ba4"
+
+
+def bold_font(base) -> "QFont":
+    """A bold copy of a base font with a guaranteed-valid size. The app font
+    is pixel-sized (QSS 'font-size: 13px'), so pointSize() is -1 on it;
+    copying that and letting Qt re-derive a point size triggers a harmless
+    'setPointSize <= 0' warning. Rebuilding with the pixel size avoids it."""
+    f = QFont(base)
+    px, pt = base.pixelSize(), base.pointSize()
+    if px > 0:
+        f.setPixelSize(px)
+    elif pt > 0:
+        f.setPointSize(pt)
+    else:
+        f.setPixelSize(13)
+    f.setBold(True)
+    return f
 
 
 def knum(v: float) -> str:
@@ -1437,8 +1513,7 @@ class LedgerDialog(DarkDialog):
                 [char, f"{c_units:,}", f"{c_m3:,.0f}",
                  fmt_isk(c_isk if not partial or c_isk else None)
                  + (" (partial)" if partial and c_isk else "")])
-            f = parent.font(0)
-            f.setBold(True)
+            f = bold_font(parent.font(0))
             for col in range(4):
                 parent.setFont(col, f)
             for ore in sorted(ores_d):
@@ -1457,8 +1532,7 @@ class LedgerDialog(DarkDialog):
             ["TOTAL", f"{g_units:,}", f"{g_m3:,.0f}",
              (f"{g_isk:,.0f}" + (" (partial)" if g_isk_partial else ""))
              if g_isk else "-"])
-        f = total.font(0)
-        f.setBold(True)
+        f = bold_font(total.font(0))
         for col in range(4):
             total.setFont(col, f)
         self.tree.addTopLevelItem(total)
@@ -1684,10 +1758,9 @@ class SettingsDialog(DarkDialog):
         self.ledger_backfill = QCheckBox("Value unpriced past days at today's "
                                          "price (marked as estimated)")
         self.ledger_backfill.setChecked(bool(settings["ledger_backfill_prices"]))
-        self.upd_check = QCheckBox("Check GitHub for app updates (daily)")
+        self.upd_check = QCheckBox("Check GitHub for app updates (daily, from "
+                                   + DEFAULT_UPDATE_REPO + ")")
         self.upd_check.setChecked(bool(settings["update_check"]))
-        self.upd_repo = QLineEdit(str(settings["update_repo"]))
-        self.upd_repo.setPlaceholderText("owner/repo  (e.g. jrod/ore-hold-watcher)")
 
         self.dbg = QCheckBox("Debug logging to debug.log (verbose; off = "
                              "no log file is written)")
@@ -1713,7 +1786,6 @@ class SettingsDialog(DarkDialog):
         gf.addRow(self.ledger_prices)
         gf.addRow(self.ledger_backfill)
         gf.addRow(self.upd_check)
-        gf.addRow("GitHub repo:", self.upd_repo)
         gf.addRow(self.dbg)
         gf.addRow(self.open_log)
         tabs.addTab(gen, "General")
@@ -1799,7 +1871,6 @@ class SettingsDialog(DarkDialog):
         self.s["ledger_fetch_prices"] = self.ledger_prices.isChecked()
         self.s["ledger_backfill_prices"] = self.ledger_backfill.isChecked()
         self.s["update_check"] = self.upd_check.isChecked()
-        self.s["update_repo"] = self.upd_repo.text().strip()
         self.s["debug_verbose"] = self.dbg.isChecked()
         logging.getLogger("orewatcher").setLevel(
             logging.DEBUG if self.dbg.isChecked() else logging.INFO)
@@ -1872,6 +1943,11 @@ class MainWindow(QMainWindow):
         title = QLabel("⛏  Fleet Ore Holds")
         title.setStyleSheet("font-size: 15px; font-weight: 700;")
         hdr.addWidget(title)
+        ver = QLabel(app_version_str())
+        ver.setStyleSheet("color: #6d6f78; font-size: 11px;")
+        ver.setToolTip("Running version. Updates come from "
+                       + DEFAULT_UPDATE_REPO)
+        hdr.addWidget(ver)
         hdr.addStretch(1)
         b_ledger = QPushButton("📒")
         b_ledger.setFixedWidth(34)
@@ -2192,11 +2268,6 @@ class MainWindow(QMainWindow):
 
     # -- updates -----------------------------------------------------------------
     def manual_update_check(self):
-        if not self.updater.repo():
-            QMessageBox.information(
-                self, "Updates", "Set the GitHub repo (owner/repo) in "
-                "Settings > General first.")
-            return
         if not is_frozen():
             QMessageBox.information(
                 self, "Updates", "Running from source - update by pulling "
@@ -2218,17 +2289,40 @@ class MainWindow(QMainWindow):
                     f"You're on the latest version ({tag}).")
         if u.available:
             info, u.available = u.available, None
-            if info["version"] not in self._update_prompted:
-                self._update_prompted.add(info["version"])
-                ans = QMessageBox.question(
-                    self, "Update available",
-                    f"Version {info['version']} is available "
-                    f"(you have {info['current']}).\n\n"
-                    "Download and restart to update now?",
-                    QMessageBox.Yes | QMessageBox.No)
-                if ans == QMessageBox.Yes:
+            ver = info["version"]
+            skipped = str(self.settings["update_skip_version"])
+            # a manual "Check for updates" always shows the dialog, even for
+            # a version previously skipped or already prompted this session
+            if u.manual or (ver not in self._update_prompted and ver != skipped):
+                self._update_prompted.add(ver)
+                box = QMessageBox(self)
+                box.setWindowTitle("Update available")
+                box.setText(f"Version {ver} is available "
+                            f"(you have {info['current']}).")
+                box.setInformativeText(
+                    "Update now downloads it and restarts the app. Later asks "
+                    "again next launch. Skip this version won't ask again "
+                    "for it.")
+                b_update = box.addButton("Update now", QMessageBox.AcceptRole)
+                box.addButton("Later", QMessageBox.RejectRole)
+                b_skip = box.addButton("Skip this version",
+                                       QMessageBox.DestructiveRole)
+                style_titlebar(box)
+                box.exec()
+                clicked = box.clickedButton()
+                if clicked is b_update:
+                    self.status.setText("")  # (main window status untouched)
                     u.download_async(info["url"])
+                    self.tray.showMessage(
+                        APP_NAME, f"Downloading {ver}… the app will restart "
+                        "when it's ready.", QSystemTrayIcon.Information, 5000)
+                elif clicked is b_skip:
+                    self.settings["update_skip_version"] = ver
+                    self.settings.save()
         if u.downloaded:
+            # consented earlier; warn at the actual restart moment too
+            self.tray.showMessage(APP_NAME, "Update downloaded - restarting "
+                                  "now.", QSystemTrayIcon.Information, 3000)
             if u.apply():          # swap script waits for our exit
                 self.quit()
             else:

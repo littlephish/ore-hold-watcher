@@ -292,18 +292,22 @@ emergency-warp handling, which is the point of doing it before shutdown.
 
 ## Auto-update
 
-Once the app is published on GitHub with the release workflow, the built
-exe can update itself. Set "GitHub repo" on the Settings General tab to
-your `owner/repo` and leave "Check GitHub for app updates" ticked. The app
-checks the latest release 20 seconds after launch and daily after that;
-the tray menu also has "Check for updates" for an on-demand check.
+The built exe updates itself from GitHub, from the fixed repo
+`littlephish/ore-hold-watcher`. Leave "Check GitHub for app updates"
+ticked and it works out of the box. The app checks the latest release
+20 seconds after launch and daily after that; the tray menu also has
+"Check for updates" for an on-demand check. When you accept an update it
+downloads the new exe, waits for this process to fully exit, then swaps
+the file in (retrying briefly if a onefile exe or antivirus still holds a
+lock) and relaunches.
 
-When a newer version exists you get a prompt showing both versions. Accept
-and the app downloads the new exe next to the current one, writes a small
-swap script, exits, and the script replaces the exe and relaunches it.
-Your settings and state are untouched (they live beside the exe and are
-not part of the download). Decline and it won't nag again about that
-version until the next restart.
+When a newer version exists you get a dialog showing both versions with
+three choices: **Update now** downloads the new exe, shows a "restarting"
+notice, then swaps it in and relaunches (your settings and state are
+untouched - they live beside the exe and aren't part of the download);
+**Later** dismisses and asks again next launch; **Skip this version**
+never asks about that version again. A manual "Check for updates" from the
+tray always shows the dialog, even for a version you skipped.
 
 Version comparison uses the version stamped into the exe by
 `release.yml`, so it only works for exes built from a tag. Running from
