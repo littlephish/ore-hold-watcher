@@ -62,6 +62,16 @@ the character row and pick **Reset**. You can also pick **Set current m³…**
 to calibrate to what the client shows, or **Set capacity…** per character.
 The default capacity is 180,000 m³ and can be changed in Settings, where an
 info button lists standard hold sizes per ship (Venture through Rorqual).
+The logs don't record which ship a character is flying, so capacity is a
+per-character setting. If a hold runs past its configured capacity - often
+because a pilot's skills give a bigger hold than the default - an amber
+"⤴ resize" link appears on that row; click it to bump to that ship class's
+max-skill size (an Orca 180,000 → 187,500 for Industrial Command Ships V),
+or to the estimate. The nudge only shows while the estimate is between the
+configured capacity and the ship's max-skill hold - once it runs past even
+the max-skill size that's estimate drift (a missing reset), not a too-small
+capacity, so the nudge stops rather than pushing you to a bigger ship class
+you're not flying.
 
 In-ship compression is tracked automatically and was verified against real
 gamelogs. A `Successfully compressed X into N Compressed X` line shrinks
