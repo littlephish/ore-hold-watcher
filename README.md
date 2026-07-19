@@ -7,6 +7,32 @@ entirely on your machine: no Discord bot, no ESI, no API keys, no network
 access beyond the alert methods you turn on. The only input is the log
 files EVE already writes to `Documents\EVE\logs\Gamelogs`.
 
+![Fleet window](screenshots/window.png)
+
+At a glance it gives you, per character: fill percent, a colored bar, the
+estimated m³, a time-to-full ETA, and an armed/idle/closed status chip. On
+top of that:
+
+- Alerts at your threshold through pop-up, on-screen overlay, sound, a
+  Discord/IFTTT/generic webhook, or ntfy phone push - one fleet digest,
+  rate-limited, listing every pilot.
+- Compression tracked automatically; time-to-full ETA per pilot from each
+  pilot's own mining rate.
+- Extra alerts (all opt-in): a pilot idle for X minutes, a pilot attacked
+  by a player (never NPC rats), a mining drone stopping on a dry rock.
+- Closed-client detection so a logged-off alt never reads as "idle".
+- A daily mining ledger with per-character ore, m³, and compressed-price
+  ISK, plus a trend chart over any range (day/week/month buckets).
+- Self-updating from GitHub, a privacy mode for screenshots, and an
+  optional force-close of all clients before daily downtime.
+
+| Daily ledger | Trend chart |
+|---|---|
+| ![Ledger](screenshots/ledger.png) | ![Trend](screenshots/chart.png) |
+
+*(Screenshots use privacy mode - real pilot names are aliased to Pilot 1-4
+and the folder path is masked.)*
+
 ## Quick start (no packaging)
 
 1. Install Python 3.10+ from python.org and check "Add to PATH".
@@ -68,6 +94,16 @@ minutes. Skills, drones, ship bonuses, and boosts are all reflected
 because the rate is measured from the character's real cycles. The status
 line and tray tooltip show which hold fills first fleet-wide. A pilot with
 no mining cycle for 5+ minutes shows no ETA.
+
+## Privacy mode (for screenshots)
+
+Tick "Privacy mode for screenshots" on the Settings General tab before
+sharing a screenshot. It masks the watched-folder path (so your
+`C:\Users\…` doesn't leak) to `…\EVE\logs\Gamelogs`, and replaces every
+character name with a stable alias (Pilot 1, Pilot 2, …) across the window,
+tray tooltip, ledger table, and chart. Aliases are assigned by real name so
+the same pilot is always the same Pilot number. Alerts and webhooks still
+send real names - this only changes what's on screen.
 
 ## Where the fill percentage is shown
 
@@ -393,6 +429,38 @@ reading gamelogs, that change wins.
 MIT - see [LICENSE](LICENSE) for details. The license covers this app's
 code only; EVE Online and all CCP property remain CCP's, per the notice
 below.
+
+## CCP Developer License Agreement
+
+CCP's [Developer License Agreement](https://developers.eveonline.com/license-agreement)
+governs applications that use CCP Tools (ESI, SSO) and Licensed Materials.
+Ore Hold Watcher uses none of those - it reads only the local gamelog text
+files the EVE client writes - so by its own scope clause the agreement does
+not strictly apply here; a log reader is governed by CCP's general EULA and
+Third-Party Policies (covered above). The app nonetheless adheres to the
+Developer License Agreement's substantive terms:
+
+- Non-commercial and non-profit: it is free and open source, sold nothing,
+  and solicits no fees, donations, or ad revenue (Sections 1.13, 4).
+- No prohibited use: no malware, phishing, spam, fraud, or denial-of-service
+  (Section 2.3). It reads only the local player's own logs and transmits
+  nothing except the alerts that player configures to their own webhook or
+  ntfy topic.
+- No misrepresentation: it does not present itself as, or as affiliated
+  with, CCP, and does not combine the EVE logo with its own marks - its icon
+  is an original gauge, not CCP art (Sections 2.7, 7.3).
+- Proprietary notice preserved (Section 7.1), reproduced below.
+
+The one item to use judgment on: a combat alert can name an attacking
+player in a message you send to your own Discord/ntfy. That is transient,
+player-initiated intel to your own channel (the kind of local-intel EVE
+tools have long produced), not systematic tracking, but keep it off if you
+prefer not to relay other players' names.
+
+Required notice (Section 7.1):
+
+> © CCP hf. All rights reserved. "EVE", "EVE Online", "CCP", and all related
+> logos and images are trademarks or registered trademarks of CCP hf.
 
 ## CCP hf. copyright notice
 
