@@ -372,7 +372,10 @@ class Engine:
         #         snapshot; quantities stay exact, only the ISK basis is
         #         stored so past days keep their worth-when-mined)
         # marks:  char -> high-water log ts (replay-safe accrual)
-        self.ledger = {"marks": {}, "days": {}, "prices": {}}
+        # activity: day -> char -> state -> seconds spent in that state
+        #         (mining / idle / full / offline). Forward-accumulated from
+        #         live ticks by the GUI; not derived from logs on replay.
+        self.ledger = {"marks": {}, "days": {}, "prices": {}, "activity": {}}
         self._load_ledger()
         self.table = OreTable(ore_override_path)
         pats = mining_patterns or DEFAULT_MINING_PATTERNS
@@ -431,7 +434,8 @@ class Engine:
             if isinstance(data.get("days"), dict):
                 self.ledger = {"marks": dict(data.get("marks", {})),
                                "days": data["days"],
-                               "prices": dict(data.get("prices", {}))}
+                               "prices": dict(data.get("prices", {})),
+                               "activity": dict(data.get("activity", {}))}
         except Exception as e:
             log.warning("ledger load failed: %s", e)
 
@@ -451,11 +455,17 @@ class Engine:
         if not self.ledger_path:
             return
         days = self.ledger["days"]
-        keep = set(sorted(days)[-400:])   # ~13 months of history
+        activity = self.ledger.setdefault("activity", {})
+        # keep window spans BOTH mined-ore days and activity days: a day can
+        # have logged time-in-state without a single mining event (all idle)
+        all_days = set(days) | set(activity)
+        keep = set(sorted(all_days)[-400:])   # ~13 months of history
         for old in [d for d in days if d not in keep]:
             days.pop(old, None)
         for old in [d for d in self.ledger["prices"] if d not in keep]:
             self.ledger["prices"].pop(old, None)
+        for old in [d for d in activity if d not in keep]:
+            activity.pop(old, None)
         try:
             self.ledger_path.write_text(
                 json.dumps(self.ledger, indent=1), encoding="utf-8")
@@ -471,6 +481,19 @@ class Engine:
         ores_d = per_char.setdefault(ev.character, {})
         ores_d[ev.ore] = ores_d.get(ev.ore, 0) + ev.qty
         self.ledger["marks"][ev.character] = ev.ts
+        return True
+
+    def activity_add(self, character: str, state: str, seconds: float,
+                     day: str | None = None) -> bool:
+        """Add `seconds` of wall-clock time to (day, character, state).
+        State is one of mining/idle/full/offline. Returns True if anything
+        was recorded (so the caller can mark the ledger dirty)."""
+        if not state or seconds <= 0:
+            return False
+        day = day or now_ts()[:10]      # "YYYY.MM.DD" (UTC == EVE time)
+        per_char = self.ledger.setdefault("activity", {}).setdefault(day, {})
+        states = per_char.setdefault(character, {})
+        states[state] = states.get(state, 0.0) + float(seconds)
         return True
 
     # -- character helpers ---------------------------------------------------

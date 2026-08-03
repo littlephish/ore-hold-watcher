@@ -255,6 +255,14 @@ again, and it never fires at startup for pilots who already stopped before
 the app launched. Use it to catch depleted belts, returned drones, or a
 client that got bumped or disconnected.
 
+An all-clear option (off by default) sends a green "resolved" note through
+the same methods when a problem clears: a pilot that was flagged idle or
+drone-stopped starts mining again ("✅ … mining resumed"), or a hold that
+crossed the threshold/full drops back below the re-arm level after you
+unload, compress, or reset ("✅ … hold back to safe"). On Discord the
+embed is green regardless of the current fill, so a glance at the color
+tells you problem versus resolved.
+
 Each method is a checkbox on the Alerts tab, saved in `settings.json`:
 
 - **Pop-up**: native Windows toast (tray balloon as fallback). Obeys Focus

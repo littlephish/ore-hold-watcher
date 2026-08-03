@@ -199,6 +199,7 @@ DEFAULT_SETTINGS = {
     "alert_interval_min": 5.0,  # at most one alert per X minutes (0 = every alert)
     "idle_alert_enabled": True,  # alert when a pilot stops receiving ore ticks
     "idle_alert_min": 5.0,       # ... for this many minutes
+    "allclear_enabled": False,   # green "resolved" note when an issue clears
     "combat_alert_enabled": False,  # scan/alert on PLAYER aggression (never NPC)
     "combat_alert_cooldown_s": 120,  # per-pilot cooldown between combat alerts
     "drone_alert_enabled": False,   # alert when mining drones stop (rock depleted)
@@ -777,6 +778,18 @@ def fmt_eta(seconds: float) -> str:
     return "<1m"
 
 
+def fmt_dur(seconds: float) -> str:
+    """Human duration for time-in-state cells: '2h 05m', '37m', '48s'."""
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m:02d}m"
+    return f"{m}m"
+
+
 def fill_color(pct: float) -> str:
     if pct >= 90:
         return "#f23f43"   # red
@@ -963,6 +976,8 @@ class Notifier:
         else:
             desc = body
             color = 0xF0B232
+        if (payload or {}).get("allclear"):   # green regardless of fill
+            color = 0x23A55A
         data = {"embeds": [{"title": title, "description": desc[:4000],
                             "color": color,
                             "footer": {"text": "Ore Hold Watcher"}}]}
@@ -1091,6 +1106,14 @@ class CharRow(QWidget):
 CHART_SERIES = ["#3987e5", "#008300", "#d55181", "#c98500",
                 "#199e70", "#d95926", "#9085e9", "#e66767"]
 CHART_OTHER = "#6d6f78"
+# Time-in-state buckets (engine key, display label, color). Colors match the
+# app's fill palette: mining green, idle amber, full red, offline grey.
+ACTIVITY_STATES = [
+    ("mining",  "Mining",  "#23a55a"),
+    ("idle",    "Idle",    "#f0b232"),
+    ("full",    "Full",    "#f23f43"),
+    ("offline", "Offline", "#6d6f78"),
+]
 CHART_SURFACE = "#313338"
 CHART_GRID = "#3f4147"
 CHART_TEXT = "#dbdee1"
@@ -1135,16 +1158,20 @@ class LedgerChart(QWidget):
         self.values: dict = {}             # day -> {char: value}
         self.labels: list[str] = []
         self.unit = "m³"
+        self.color_map: dict = {}          # optional fixed series -> color
         self.setMouseTracking(True)
         self.setMinimumHeight(260)
         self._hit: list[tuple] = []        # (QRect, char, day, value)
 
-    def set_data(self, days, series, values, unit, labels=None):
+    def set_data(self, days, series, values, unit, labels=None, color_map=None):
         self.days, self.series, self.values, self.unit = days, series, values, unit
         self.labels = labels or [d[5:] for d in days]  # default MM.DD
+        self.color_map = color_map or {}
         self.update()
 
     def color_for(self, char: str) -> str:
+        if char in self.color_map:
+            return self.color_map[char]
         try:
             i = self.series.index(char)
         except ValueError:
@@ -1258,6 +1285,9 @@ class LedgerDialog(DarkDialog):
         if main.settings["privacy_mode"]:   # stable aliases across all history
             main.seed_aliases(c for day in main.engine.ledger["days"].values()
                               for c in day)
+            main.seed_aliases(
+                c for day in main.engine.ledger.get("activity", {}).values()
+                for c in day)
         from PySide6.QtWidgets import QComboBox, QTreeWidget
 
         self.day_combo = QComboBox()
@@ -1319,16 +1349,62 @@ class LedgerDialog(DarkDialog):
         self.chart = LedgerChart()
         tlay.addWidget(self.chart, 1)
 
+        # Activity tab: per-day time-in-state, plus a stacked-hours trend
+        act_tab = QWidget()
+        aclay = QVBoxLayout(act_tab)
+        adrow = QHBoxLayout()
+        adrow.addWidget(QLabel("Day (EVE/UTC):"))
+        self.act_day_combo = QComboBox()
+        for d in sorted(main.engine.ledger.get("activity", {}), reverse=True):
+            self.act_day_combo.addItem(d)
+        self.act_day_combo.currentTextChanged.connect(
+            lambda *_: self.populate_activity())
+        adrow.addWidget(self.act_day_combo, 1)
+        aclay.addLayout(adrow)
+
+        self.act_tree = QTreeWidget()
+        self.act_tree.setColumnCount(6)
+        self.act_tree.setHeaderLabels(
+            ["Character"] + [lbl for _, lbl, _ in ACTIVITY_STATES] + ["Total"])
+        self.act_tree.setRootIsDecorated(False)
+        aclay.addWidget(self.act_tree, 1)
+
+        acrow = QHBoxLayout()
+        acrow.addWidget(QLabel("Trend range:"))
+        self.act_range_combo = QComboBox()
+        for lbl, days in (("7 days", 7), ("30 days", 30), ("90 days", 90),
+                          ("1 year", 365), ("All", 0)):
+            self.act_range_combo.addItem(lbl, days)
+        self.act_range_combo.setCurrentIndex(1)   # 30 days
+        self.act_range_combo.currentTextChanged.connect(
+            lambda *_: self.update_activity_chart())
+        acrow.addWidget(self.act_range_combo)
+        acrow.addStretch(1)
+        aclay.addLayout(acrow)
+        self.act_chart = LedgerChart()
+        aclay.addWidget(self.act_chart, 1)
+        act_note = QLabel(
+            "Time each pilot spent Mining / Idle / Full / Offline, measured "
+            "while the watcher was running (not reconstructed from old logs). "
+            "Offline needs client detection on; otherwise a logged-off pilot "
+            "counts as Idle.")
+        act_note.setWordWrap(True)
+        act_note.setStyleSheet("color: #949ba4;")
+        aclay.addWidget(act_note)
+
         from PySide6.QtWidgets import QTabWidget
         tabs = QTabWidget()
         tabs.addTab(day_tab, "Day detail")
         tabs.addTab(trend_tab, "Trend")
+        tabs.addTab(act_tab, "Activity")
 
         lay = QVBoxLayout(self)
         lay.addWidget(tabs, 1)
         lay.addWidget(self.status)
         lay.addWidget(bb)
-        self.resize(680, 520)
+        # taller by default: the Activity tab stacks a table AND a chart, so
+        # 520 clipped the chart. This fits both without scrolling.
+        self.resize(680, 720)
 
         # ISK uses each day's FROZEN price snapshot (the "Compressed <ore>"
         # market price, since raw ore isn't sold) so priced days keep their
@@ -1350,6 +1426,8 @@ class LedgerDialog(DarkDialog):
                 self._poll.start(500)
         self.populate()
         self.update_chart()
+        self.populate_activity()
+        self.update_activity_chart()
 
     def _today_price(self, ore: str):
         key = "Compressed " + ore
@@ -1568,6 +1646,72 @@ class LedgerDialog(DarkDialog):
         elif not self.main.prices.error:
             self.status.setText("")
 
+    def populate_activity(self):
+        from PySide6.QtWidgets import QTreeWidgetItem
+        self.act_tree.clear()
+        day = self.act_day_combo.currentText()
+        data = self.main.engine.ledger.get("activity", {}).get(day, {})
+        keys = [k for k, _, _ in ACTIVITY_STATES]
+        totals = {k: 0.0 for k in keys}
+        for char in sorted(data, key=lambda c: c.lower()):
+            st = data[char]
+            row_total = 0.0
+            cells = [self.main.disp(char)]
+            for k in keys:
+                v = float(st.get(k, 0.0))
+                row_total += v
+                totals[k] += v
+                cells.append(fmt_dur(v) if v else "-")
+            cells.append(fmt_dur(row_total))
+            item = QTreeWidgetItem(cells)
+            item.setFont(0, bold_font(item.font(0)))
+            self.act_tree.addTopLevelItem(item)
+        grand = sum(totals.values())
+        tot = QTreeWidgetItem(
+            ["TOTAL"] + [fmt_dur(totals[k]) if totals[k] else "-" for k in keys]
+            + [fmt_dur(grand) if grand else "-"])
+        f = bold_font(tot.font(0))
+        for col in range(6):
+            tot.setFont(col, f)
+        self.act_tree.addTopLevelItem(tot)
+        for col in range(6):
+            self.act_tree.resizeColumnToContents(col)
+
+    def update_activity_chart(self):
+        act = self.main.engine.ledger.get("activity", {})
+        days_all = sorted(act)
+        span_days = int(self.act_range_combo.currentData())
+        if span_days and days_all:
+            from datetime import date, timedelta
+            y, m, d = (int(x) for x in days_all[-1].split("."))
+            cutoff = (date(y, m, d) - timedelta(days=span_days - 1)).strftime(
+                "%Y.%m.%d")
+            day_keys = [d for d in days_all if d >= cutoff]
+        else:
+            day_keys = days_all
+
+        n = len(day_keys)
+        grp = "day" if n <= 31 else ("week" if n <= 183 else "month")
+        series = [lbl for _, lbl, _ in ACTIVITY_STATES]
+        color_map = {lbl: col for _, lbl, col in ACTIVITY_STATES}
+
+        values: dict = {}
+        labels: dict = {}
+        order: list = []
+        for day in day_keys:
+            bkey, blab = self._bucket(day, grp)
+            if bkey not in values:
+                values[bkey] = {lbl: 0.0 for lbl in series}
+                labels[bkey] = blab
+                order.append(bkey)
+            per = values[bkey]
+            for st in act[day].values():
+                for key, lbl, _ in ACTIVITY_STATES:
+                    per[lbl] += float(st.get(key, 0.0)) / 3600.0  # -> hours
+        self.act_chart.set_data(order, series, values, "h",
+                                labels=[labels[k] for k in order],
+                                color_map=color_map)
+
 
 # ---------------------------------------------------------------------------
 # Settings dialog
@@ -1705,6 +1849,10 @@ class SettingsDialog(DarkDialog):
         self.idle_min.setSuffix(" min")
         self.idle_min.setValue(float(settings["idle_alert_min"]))
 
+        self.allclear = QCheckBox("Also send an all-clear (green) note when an "
+                                  "issue resolves (mining resumes, hold back "
+                                  "to safe)")
+        self.allclear.setChecked(bool(settings["allclear_enabled"]))
         self.combat_on = QCheckBox("Alert when a pilot is attacked by a PLAYER "
                                    "(NPC rats never alert)")
         self.combat_on.setChecked(bool(settings["combat_alert_enabled"]))
@@ -1827,6 +1975,7 @@ class SettingsDialog(DarkDialog):
         af.addRow("Min. time between alerts:", self.interval)
         af.addRow(self.idle_on)
         af.addRow("Idle after:", self.idle_min)
+        af.addRow(self.allclear)
         af.addRow(self.combat_on)
         af.addRow("Combat re-alert:", self.combat_cd)
         af.addRow(self.drone_on)
@@ -1890,6 +2039,7 @@ class SettingsDialog(DarkDialog):
         self.s["alert_interval_min"] = self.interval.value()
         self.s["idle_alert_enabled"] = self.idle_on.isChecked()
         self.s["idle_alert_min"] = self.idle_min.value()
+        self.s["allclear_enabled"] = self.allclear.isChecked()
         self.s["combat_alert_enabled"] = self.combat_on.isChecked()
         self.s["combat_alert_cooldown_s"] = self.combat_cd.value()
         self.s["drone_alert_enabled"] = self.drone_on.isChecked()
@@ -1966,6 +2116,8 @@ class MainWindow(QMainWindow):
         self.clients = ClientWatcher(self.settings["eve_process_names"])
         self._last_client_scan = 0.0
         self._last_price_check = 0.0
+        self._last_activity_ts = 0.0    # wall-clock of last time-in-state accrual
+        self._last_activity_save = 0.0  # throttle ledger writes for activity
 
         self.setWindowTitle(APP_NAME)
         try:
@@ -2054,6 +2206,9 @@ class MainWindow(QMainWindow):
         self._last_alert_ts = 0.0     # rate limiter for threshold alerts
         self._combat_alerted: dict[str, float] = {}  # per-pilot combat cooldown
         self._drone_alerted: dict[str, float] = {}   # per-pilot drone cooldown
+        # pilots with an open problem, awaiting an all-clear:
+        self._pending_resume: set[str] = set()  # idle/drone alerted; clears on mining
+        self._pending_safe: set[str] = set()    # threshold/full; clears below re-arm
         self._alert_pending = False
         self._pending_title = ""
 
@@ -2142,11 +2297,19 @@ class MainWindow(QMainWindow):
 
     def quit(self):
         self.engine.save_state()
+        if self.settings["ledger_enabled"]:
+            self.engine.save_ledger()   # persist the last unsaved activity slice
         self.tray.hide()
         QApplication.quit()
 
     # -- notifications --------------------------------------------------------
     def notify(self, title: str, body: str, payload: dict | None = None):
+        self.notifier.alert(title, body, payload)
+
+    def send_allclear(self, title: str):
+        """A green 'resolved' notification through every enabled method."""
+        body, payload = self.fleet_summary()
+        payload["allclear"] = True
         self.notifier.alert(title, body, payload)
 
     def fleet_summary(self) -> tuple[str, dict]:
@@ -2442,6 +2605,39 @@ class MainWindow(QMainWindow):
             self._last_update_check = time.time()
             u.check_async()
 
+    # -- time-in-state accounting -----------------------------------------------
+    def _accrue_activity(self, is_closed) -> None:
+        """Add the elapsed wall-clock since the last tick to each tracked
+        pilot's current-state bucket for today (UTC). State priority:
+        offline (client closed) > full > mining > idle. Only counts normal
+        tick gaps - a long gap (sleep/stall) is skipped rather than guessed,
+        and the whole thing is off unless the ledger is enabled."""
+        if not self.settings["ledger_enabled"]:
+            self._last_activity_ts = 0.0     # so resume doesn't dump a big gap
+            return
+        now = time.time()
+        dt = now - self._last_activity_ts
+        self._last_activity_ts = now
+        poll_s = max(1.0, float(self.settings["poll_seconds"]))
+        if not (0 < dt <= poll_s * 3 + 1):   # first tick / abnormal gap
+            return
+        day = time.strftime("%Y.%m.%d", time.gmtime())
+        recorded = False
+        for c in self.engine.chars.values():
+            if is_closed(c.name):
+                state = "offline"
+            elif c.est_m3 >= c.capacity * 0.999:
+                state = "full"
+            elif c.mining_rate_m3_min(now) > 0:
+                state = "mining"
+            else:
+                state = "idle"
+            if self.engine.activity_add(c.name, state, dt, day):
+                recorded = True
+        if recorded and now - self._last_activity_save > 60:
+            self._last_activity_save = now
+            self.engine.save_ledger()
+
     # -- main loop --------------------------------------------------------------
     def tick(self):
         events = self.engine.poll()
@@ -2464,6 +2660,13 @@ class MainWindow(QMainWindow):
             if (isinstance(ev, MiningEvent) and
                     now_utc - ts_to_epoch(ev.ts) < idle_after):
                 self.engine.char(ev.character).idle_notified = False
+                # all-clear: this pilot was flagged idle/drone-stopped and is
+                # now mining again
+                if (self.settings["allclear_enabled"] and
+                        ev.character in self._pending_resume):
+                    self._pending_resume.discard(ev.character)
+                    self.send_allclear(
+                        f"✅ {self.disp(ev.character)} - mining resumed")
             # PLAYER aggression: urgent, bypasses the digest rate limiter.
             # NPC rats (is_player=False) never alert. The 2-minute liveness
             # guard keeps startup replay of old fights silent.
@@ -2490,6 +2693,7 @@ class MainWindow(QMainWindow):
                 cd = float(self.settings["drone_alert_cooldown_s"])
                 if now_utc - self._drone_alerted.get(ev.character, 0.0) >= cd:
                     self._drone_alerted[ev.character] = now_utc
+                    self._pending_resume.add(ev.character)
                     self.request_alert(
                         f"🛑 {ev.character} - mining drone(s) stopped "
                         f"(asteroid depleted)")
@@ -2497,6 +2701,7 @@ class MainWindow(QMainWindow):
                 c = self.engine.char(ev.character)
                 if not c.notified:
                     c.notified = True
+                    self._pending_safe.add(ev.character)
                     self.request_alert(f"⚠ {ev.character} - ore hold FULL")
             elif isinstance(ev, UnknownOreEvent):
                 if ev.ore not in self.warned_ores:
@@ -2508,9 +2713,18 @@ class MainWindow(QMainWindow):
         for c in self.engine.chars.values():
             if c.pct >= threshold and not c.notified:
                 c.notified = True
+                self._pending_safe.add(c.name)
                 self.request_alert(f"⚠ {c.name} - {c.pct:.1f}% full")
             elif c.pct < rearm and c.notified:
                 c.notified = False
+                # all-clear: hold dropped back to a safe level (unloaded,
+                # compressed, or reset)
+                if (self.settings["allclear_enabled"] and
+                        c.name in self._pending_safe):
+                    self._pending_safe.discard(c.name)
+                    self.send_allclear(
+                        f"✅ {self.disp(c.name)} - hold back to safe "
+                        f"({c.pct:.1f}%)")
         # idle detection: armed pilots whose ticks stopped for idle_after.
         # A CLOSED client is not idle: it disarms silently and never fires
         # the idle alert (re-arms automatically on the next live tick).
@@ -2524,8 +2738,10 @@ class MainWindow(QMainWindow):
                 gap = now_utc - c.rate_events[-1][0]
                 if gap >= idle_after:
                     c.idle_notified = True   # fire once until mining resumes
+                    self._pending_resume.add(c.name)
                     self.request_alert(
                         f"⏸ {c.name} - no ore ticks for {int(gap // 60)} min")
+        self._accrue_activity(is_closed)
         self._flush_alert()          # send any alert the rate limiter held back
         self._check_downtime_close()
         self._maintain_prices()
