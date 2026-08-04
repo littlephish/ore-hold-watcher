@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX manifest for Ore Hold Watcher (packaged full-trust Win32 app).
+
+  The CI workflow (.github/workflows/msix.yml) fills in the two tokens below
+  before packing:
+    {{VERSION}}   -> the tag version as x.y.z.0 (4 parts, revision 0)
+    {{PUBLISHER}} -> the SIGNING CERTIFICATE's Subject, verbatim. It MUST
+                     match the cert byte-for-byte or the package won't install,
+                     so the workflow reads it from the cert rather than
+                     hardcoding it here.
+
+  runFullTrust is required: the app reads gamelogs anywhere under Documents,
+  enumerates EVE client windows, and can taskkill EVE before downtime - none
+  of which a sandboxed UWP app could do. It's a restricted capability, fine
+  for sideloading; a Store submission would need CCP/Microsoft approval.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity
+    Name="JaredArmstrong.OreHoldWatcher"
+    Publisher="{{PUBLISHER}}"
+    Version="{{VERSION}}"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Ore Hold Watcher</DisplayName>
+    <PublisherDisplayName>Jared Armstrong</PublisherDisplayName>
+    <Description>Local EVE Online ore hold tracker: watches your gamelogs, estimates each character's ore hold fill, and alerts before a hold is full.</Description>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+
+  <Applications>
+    <Application Id="OreHoldWatcher"
+      Executable="OreHoldWatcher.exe"
+      EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Ore Hold Watcher"
+        Description="Local EVE Online ore hold tracker: watches your gamelogs, estimates each character's ore hold fill, and alerts before a hold is full."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+</Package>

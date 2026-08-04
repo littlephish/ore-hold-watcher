@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LittlePhish
 """Headless tests for the log engine. Run: python test_engine.py"""
 import tempfile
 import time

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LittlePhish
 """Log-watching / ore-hold-estimation engine for Ore Hold Watcher.
 
 Pure Python (no Qt) so it can be unit-tested headless. The GUI drives it by

@@ -444,9 +444,15 @@ reading gamelogs, that change wins.
 
 ## License
 
-MIT - see [LICENSE](LICENSE) for details. The license covers this app's
-code only; EVE Online and all CCP property remain CCP's, per the notice
-below.
+GNU General Public License v3.0 - see [LICENSE](LICENSE) for the full text.
+In short: this app is free software; you may use, study, share, and modify
+it, but any distributed derivative must also be licensed under GPLv3 and ship
+its source. The license covers this app's code only; EVE Online and all CCP
+property remain CCP's, per the notice below.
+
+This app bundles Qt (via PySide6, LGPLv3) in its packaged builds; those
+builds carry the relevant third-party license notices, and the Qt libraries
+can be replaced by the user as LGPLv3 requires.
 
 ## CCP Developer License Agreement
 

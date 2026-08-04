@@ -1,3 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LittlePhish
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version. It is distributed WITHOUT ANY WARRANTY; see the GNU
+# General Public License (the LICENSE file, or <https://www.gnu.org/licenses/>)
+# for details.
 """Ore Hold Watcher - local EVE Online ore hold tracker.
 
 Sits in the system tray, tails your EVE gamelogs, estimates each character's
@@ -559,6 +568,24 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
 
 
+def is_packaged() -> bool:
+    """True when running inside an MSIX/AppX package. The package install dir
+    is read-only and tamper-protected, so the in-place exe self-updater must
+    stay off - MSIX updates come from App Installer / a reinstall instead."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        length = ctypes.c_uint32(0)
+        # GetCurrentPackageFullName: APPMODEL_ERROR_NO_PACKAGE (15700) when
+        # unpackaged; ERROR_INSUFFICIENT_BUFFER (122) when packaged.
+        rc = ctypes.windll.kernel32.GetCurrentPackageFullName(
+            ctypes.byref(length), None)
+        return rc != 15700
+    except Exception:
+        return False
+
+
 def current_exe_version() -> str | None:
     """Version stamped into the running exe by the release build.
     None when running from source (auto-update is disabled then)."""
@@ -617,7 +644,8 @@ class Updater:
                 or DEFAULT_UPDATE_REPO)
 
     def can_update(self) -> bool:
-        return bool(self.repo()) and is_frozen() and sys.platform == "win32"
+        return (bool(self.repo()) and is_frozen() and sys.platform == "win32"
+                and not is_packaged())
 
     # -- phase 1: check ------------------------------------------------------
     def check_async(self, manual: bool = False):
@@ -2009,9 +2037,16 @@ class SettingsDialog(DarkDialog):
         bb.rejected.connect(self.reject)
 
         notice = QLabel(
+            'Ore Hold Watcher © 2026 LittlePhish - free software under the GNU '
+            'GPL v3 or later; comes with ABSOLUTELY NO WARRANTY. '
+            '<a href="https://www.gnu.org/licenses/gpl-3.0.html" '
+            'style="color:#6d6f78;">License</a> · '
+            '<a href="https://github.com/littlephish/ore-hold-watcher" '
+            'style="color:#6d6f78;">Source</a><br>'
             'EVE Online and the EVE logo are trademarks of CCP hf. This app '
             'is not affiliated with or endorsed by CCP. '
             '© CCP hf. All rights reserved.')
+        notice.setOpenExternalLinks(True)
         notice.setWordWrap(True)
         notice.setStyleSheet("color: #6d6f78; font-size: 10px;")
 
@@ -2540,6 +2575,12 @@ class MainWindow(QMainWindow):
 
     # -- updates -----------------------------------------------------------------
     def manual_update_check(self):
+        if is_packaged():
+            QMessageBox.information(
+                self, "Updates", "This is the MSIX build - updates are managed "
+                "by Windows (App Installer / reinstall the package), so the "
+                "in-app updater is disabled.")
+            return
         if not is_frozen():
             QMessageBox.information(
                 self, "Updates", "Running from source - update by pulling "
