@@ -1,8 +1,13 @@
 # MSIX packaging
 
-The [MSIX workflow](../.github/workflows/msix.yml) builds a signed `.msix`
-installer from the same version tags as the exe release and attaches it (plus
-the public `.cer`) to that GitHub Release.
+> **Status: parked.** The MSIX GitHub Actions workflow has been removed — the
+> shipped distribution is the zip + Inno Setup installer (`release.yml`). This
+> file and [`AppxManifest.xml`](AppxManifest.xml) are kept as a reference for
+> if/when MSIX is revisited. To rebuild the workflow, re-create
+> `.github/workflows/msix.yml` around the steps described below.
+
+The workflow (when present) builds a signed `.msix` installer and attaches it,
+plus the public `.cer`, to a GitHub Release.
 
 - **Build:** Nuitka `--standalone` (a folder of files, not onefile — the right
   shape for a package).

@@ -64,8 +64,7 @@ Double-click `build.bat`. It installs Nuitka into the venv and compiles a
 standalone folder, then stages `dist\OreHoldWatcher\` plus a portable zip (and
 the installer too, if [Inno Setup](https://jrsoftware.org/isinfo.php) is
 installed - `winget install JRSoftware.InnoSetup`). The first build takes
-several minutes and needs no key presses. There's also an MSIX build
-([packaging/README.md](packaging/README.md)) as a third distribution option.
+several minutes and needs no key presses.
 
 ## How it works
 
@@ -403,8 +402,6 @@ Push this folder to a GitHub repo and the workflows take over:
       git tag v1.0.0
       git push origin v1.0.0
 
-- `msix.yml` optionally builds a signed MSIX (see [packaging/README.md](packaging/README.md)).
-
 All are non-interactive. The first build is slow; later ones reuse the Nuitka
 compilation cache.
 
@@ -476,9 +473,9 @@ it, but any distributed derivative must also be licensed under GPLv3 and ship
 its source. The license covers this app's code only; EVE Online and all CCP
 property remain CCP's, per the notice below.
 
-This app bundles Qt (via PySide6, LGPLv3) in its packaged builds; those
-builds carry the relevant third-party license notices, and the Qt libraries
-can be replaced by the user as LGPLv3 requires.
+This app bundles Qt (via PySide6, LGPLv3) in its packaged builds. Because the
+build is a plain program folder, the Qt libraries can be replaced by the user
+as LGPLv3 allows; a bundled copy of the third-party license notices is planned.
 
 ## CCP Developer License Agreement
 
