@@ -1,5 +1,8 @@
 name: CI
 
+# Lightweight checks only: byte-compile every module and run the engine tests.
+# No packaging here - the Windows folder/zip/installer is built by release.yml
+# on version tags.
 on:
   push:
     branches: [main, master]
@@ -8,62 +11,16 @@ on:
 
 jobs:
   test:
-    name: Engine tests
+    name: Compile check & engine tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # engine/parser tests are pure stdlib — no Qt needed
-      - run: python test_engine.py
-
-  build-exe:
-    name: Build Windows folder (Nuitka standalone)
-    needs: test
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install dependencies
-        run: python -m pip install -r requirements.txt nuitka
-
-      - name: Cache Nuitka compilation cache
-        uses: actions/cache@v4
-        with:
-          path: ~\AppData\Local\Nuitka\Nuitka\Cache
-          key: nuitka-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: nuitka-${{ runner.os }}-
-
-      # standalone (folder), matching what we ship - a onefile smoke build would
-      # not exercise the same artifact and trips AV heuristics anyway
-      - name: Build
-        shell: pwsh
-        run: |
-          python -m nuitka `
-            --standalone `
-            --assume-yes-for-downloads `
-            --enable-plugin=pyside6 `
-            --windows-console-mode=disable `
-            --windows-icon-from-ico=icon.ico `
-            --company-name="LittlePhish" `
-            --product-name="Ore Hold Watcher" `
-            --file-version="1.0.${{ github.run_number }}" `
-            --product-version="1.0.${{ github.run_number }}" `
-            --output-filename=OreHoldWatcher.exe `
-            --output-dir=build `
-            app.py
-          if (-not (Test-Path "build\app.dist\OreHoldWatcher.exe")) {
-            throw "standalone build missing OreHoldWatcher.exe"
-          }
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: OreHoldWatcher-${{ github.sha }}
-          path: build/app.dist
-          if-no-files-found: error
+      # compileall catches syntax errors without importing (no Qt needed)
+      - name: Compile check
+        run: python -m compileall -q app.py engine.py ores.py test_engine.py
+      # engine/parser tests are pure stdlib
+      - name: Engine tests
+        run: python test_engine.py

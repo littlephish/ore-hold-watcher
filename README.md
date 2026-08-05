@@ -43,7 +43,7 @@ and the folder path is masked.)*
 
 Grab the latest [release](https://github.com/littlephish/ore-hold-watcher/releases):
 
-- **Installer** - `Ore Hold Watcher-<ver>-setup.exe`. Per-user install (no UAC
+- **Installer** - `OreHoldWatcher-<ver>-setup.exe`. Per-user install (no UAC
   prompt), adds Start-menu/optional desktop shortcuts, and updates itself
   in-app. Recommended.
 - **Portable zip** - `OreHoldWatcher-<ver>-win64.zip`. Unzip anywhere and run
@@ -396,7 +396,7 @@ Push this folder to a GitHub repo and the workflows take over:
 - `ci.yml` runs the engine tests on Linux for every push and PR.
 - `release.yml` triggers on a version tag: it builds a version-stamped Nuitka
   **standalone** folder and publishes a GitHub Release with both the portable
-  `OreHoldWatcher-<ver>-win64.zip` and the `Ore Hold Watcher-<ver>-setup.exe`
+  `OreHoldWatcher-<ver>-win64.zip` and the `OreHoldWatcher-<ver>-setup.exe`
   Inno Setup installer attached:
 
       git tag v1.0.0

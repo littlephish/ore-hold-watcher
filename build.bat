@@ -6,7 +6,7 @@ rem unpacks to %TEMP% and runs itself, which Defender/CrowdStrike flag as
 rem dropper behaviour. Outputs:
 rem   dist\OreHoldWatcher\OreHoldWatcher.exe   (portable program folder)
 rem   dist\OreHoldWatcher-<ver>-win64.zip      (portable zip)
-rem   dist\Ore Hold Watcher-<ver>-setup.exe    (installer, if Inno Setup found)
+rem   dist\OreHoldWatcher-<ver>-setup.exe      (installer, if Inno Setup found)
 rem
 rem First build takes a while (Nuitka compiles C).
 setlocal enableextensions

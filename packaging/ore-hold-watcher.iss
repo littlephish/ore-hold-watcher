@@ -11,6 +11,9 @@
 
 #define AppName "Ore Hold Watcher"
 #define AppExe  "OreHoldWatcher.exe"
+; no-spaces name for on-disk artifacts: the staged program folder is
+; dist\OreHoldWatcher and release.yml attaches OreHoldWatcher-*-setup.exe
+#define ArtifactName "OreHoldWatcher"
 ; CI passes the tag version with /DAppVersion=1.2.3
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -31,7 +34,7 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=..\dist
-OutputBaseFilename={#AppName}-{#AppVersion}-setup
+OutputBaseFilename={#ArtifactName}-{#AppVersion}-setup
 SetupIconFile=..\icon.ico
 Compression=lzma2/max
 SolidCompression=yes
@@ -49,7 +52,7 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 ; The whole Nuitka standalone program folder.
-Source: "..\dist\{#AppName}\*"; Excludes: "update\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\{#ArtifactName}\*"; Excludes: "update\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
