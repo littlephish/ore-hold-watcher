@@ -2331,6 +2331,14 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
         self.rows: dict[str, tuple[QWidget, CharRow]] = {}
+        # refresh throttling / repaint caches: the poll tick runs every
+        # poll_seconds for alerting, but the (much heavier) visual refresh is
+        # rate-limited and only repaints tray/rows when values actually change
+        self._last_refresh = 0.0
+        self._tray_icon_key = None    # last pct the gauge was painted for
+        self._tray_tip = ""
+        self._win_title = ""
+        self._applied_order: list | None = None  # row order last laid out
 
         # Tray
         self.tray = QSystemTrayIcon(make_tray_icon(0), self)
@@ -2432,6 +2440,10 @@ class MainWindow(QMainWindow):
         style_titlebar(self)
         # re-assert whenever the window (re)appears, e.g. from the tray
         QTimer.singleShot(0, self.apply_on_top)
+        # rows/status are skipped while hidden, so resync them now the window
+        # is visible again
+        self._applied_order = None       # force a re-layout on next refresh
+        QTimer.singleShot(0, self.refresh)
 
     def toggle_visible(self):
         if self.isVisible():
@@ -2914,13 +2926,51 @@ class MainWindow(QMainWindow):
         self._check_downtime_close()
         self._maintain_prices()
         self._pump_updates()
-        self.refresh()
+        # Decouple the visual refresh from the poll tick: repaint promptly when
+        # something actually happened (mining events), otherwise only every few
+        # seconds - and rarely while hidden in the tray, where nothing is shown.
+        min_gap = 2.0 if self.isVisible() else 10.0
+        if events or now_utc - self._last_refresh >= min_gap:
+            self._last_refresh = now_utc
+            self.refresh()
 
     def refresh(self):
         chars = sorted(self.engine.chars.values(),
                        key=lambda c: c.pct, reverse=True)
         if self.settings["privacy_mode"]:   # stable Pilot 1..N by real name
             self.seed_aliases(c.name for c in chars)
+
+        # --- tray gauge / tooltip / title: this path runs even while hidden,
+        # so only touch the shell when the displayed value actually changed.
+        # Repainting the icon and calling setIcon (a Win32 shell notify) every
+        # tick was the bulk of the idle CPU. ---
+        max_pct = max((c.pct for c in chars), default=0.0)
+        icon_key = round(min(max_pct, 100.0), 1)
+        if icon_key != self._tray_icon_key:
+            self._tray_icon_key = icon_key
+            gauge = make_tray_icon(max_pct)
+            self.tray.setIcon(gauge)
+            self.setWindowIcon(gauge)   # taskbar button shows the same gauge
+        title = f"{APP_NAME} - {max_pct:.0f}%" if chars else APP_NAME
+        if title != self._win_title:
+            self._win_title = title
+            self.setWindowTitle(title)
+
+        def tip_line(c):
+            eta = c.eta_full_s()
+            return (f"{c.pct:.1f}%  {self.disp(c.name)}" +
+                    (f"  ({fmt_eta(eta)})" if eta else ""))
+        tip = "\n".join(tip_line(c) for c in chars[:8]) or APP_NAME
+        if tip != self._tray_tip:
+            self._tray_tip = tip
+            self.tray.setToolTip(tip)
+
+        # --- everything below is visual detail that's pointless while the
+        # window is hidden in the tray; skip it entirely. showEvent forces a
+        # full refresh when the window reappears. ---
+        if not self.isVisible():
+            return
+
         wanted = [c.name for c in chars]
         # drop rows for removed chars
         for name in list(self.rows):
@@ -2928,7 +2978,9 @@ class MainWindow(QMainWindow):
                 frame, _ = self.rows.pop(name)
                 frame.setParent(None)
                 frame.deleteLater()
-        # (re)build rows in order
+                self._applied_order = None   # layout changed -> force reorder
+        # (re)build rows, only re-laying them out when the order actually changed
+        reorder = wanted != self._applied_order
         for i, c in enumerate(chars):
             if c.name not in self.rows:
                 from PySide6.QtWidgets import QFrame
@@ -2939,9 +2991,11 @@ class MainWindow(QMainWindow):
                 row = CharRow(self, c.name)
                 lay.addWidget(row)
                 self.rows[c.name] = (frame, row)
+                reorder = True
             frame, row = self.rows[c.name]
-            self.rows_box.removeWidget(frame)
-            self.rows_box.insertWidget(i, frame)
+            if reorder:
+                self.rows_box.removeWidget(frame)
+                self.rows_box.insertWidget(i, frame)
             closed = (bool(self.settings["client_watch_enabled"]) and
                       self.clients.ready and c.name not in self.clients.online)
             if closed:
@@ -2956,6 +3010,8 @@ class MainWindow(QMainWindow):
                 arm = "standby"
             row.lbl.setText(self.disp(c.name))
             row.update_state(c.est_m3, c.capacity, c.eta_full_s(), arm)
+        if reorder:
+            self._applied_order = wanted
 
         # who fills up first at current mining rates?
         etas = [(c.eta_full_s(), c) for c in chars]
@@ -2983,21 +3039,6 @@ class MainWindow(QMainWindow):
         self.status.setStyleSheet(
             "color: #f0b232;" if (not dir_ok or s["unmatched_mining"])
             else "color: #949ba4;")
-
-        max_pct = max((c.pct for c in chars), default=0.0)
-        gauge = make_tray_icon(max_pct)
-        self.tray.setIcon(gauge)
-        self.setWindowIcon(gauge)  # taskbar button shows the same live gauge
-        if chars:
-            self.setWindowTitle(f"{APP_NAME} - {max_pct:.0f}%")
-        else:
-            self.setWindowTitle(APP_NAME)
-        def tip_line(c):
-            eta = c.eta_full_s()
-            return (f"{c.pct:.1f}%  {self.disp(c.name)}" +
-                    (f"  ({fmt_eta(eta)})" if eta else ""))
-        tip = "\n".join(tip_line(c) for c in chars[:8]) or APP_NAME
-        self.tray.setToolTip(tip)
 
 
 def main():
