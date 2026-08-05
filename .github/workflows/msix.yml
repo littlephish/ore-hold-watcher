@@ -85,7 +85,7 @@ jobs:
             --enable-plugin=pyside6 `
             --windows-console-mode=disable `
             --windows-icon-from-ico=icon.ico `
-            --company-name="Jared" `
+            --company-name="LittlePhish" `
             --product-name="Ore Hold Watcher" `
             --file-version="${{ steps.ver.outputs.file }}" `
             --product-version="${{ steps.ver.outputs.file }}" `
