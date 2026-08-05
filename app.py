@@ -2336,6 +2336,7 @@ class MainWindow(QMainWindow):
         # rate-limited and only repaints tray/rows when values actually change
         self._last_refresh = 0.0
         self._tray_icon_key = None    # last pct the gauge was painted for
+        self._gauge_icon = None       # cached QIcon; rebuilt only on pct change
         self._tray_tip = ""
         self._win_title = ""
         self._applied_order: list | None = None  # row order last laid out
@@ -2948,9 +2949,14 @@ class MainWindow(QMainWindow):
         icon_key = round(min(max_pct, 100.0), 1)
         if icon_key != self._tray_icon_key:
             self._tray_icon_key = icon_key
-            gauge = make_tray_icon(max_pct)
-            self.tray.setIcon(gauge)
-            self.setWindowIcon(gauge)   # taskbar button shows the same gauge
+            self._gauge_icon = make_tray_icon(max_pct)  # rebuild pixmap on change
+            self.tray.setIcon(self._gauge_icon)         # tray: pricey shell call
+        # The taskbar icon is dropped whenever the native window is recreated
+        # (e.g. the always-on-top toggle in apply_on_top), so re-assert it
+        # cheaply on every visible refresh - setWindowIcon is a light WM_SETICON,
+        # not the pixmap repaint we cached above.
+        if self._gauge_icon is not None and self.isVisible():
+            self.setWindowIcon(self._gauge_icon)
         title = f"{APP_NAME} - {max_pct:.0f}%" if chars else APP_NAME
         if title != self._win_title:
             self._win_title = title
