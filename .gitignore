@@ -1,4 +1,4 @@
-# runtime config/state (lives beside the exe — user-specific, don't commit)
+# runtime config/state (user-specific, don't commit)
 settings.json
 state.json
 ores_override.json
@@ -15,8 +15,11 @@ __pycache__/
 
 # build output
 build/
+dist/
 *.exe
 
 # auto-update leftovers
+update/
+update-log.txt
 *.exe.new
 *.update.bat

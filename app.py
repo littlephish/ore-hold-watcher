@@ -87,32 +87,49 @@ def _writable(d: Path) -> bool:
 
 
 _CONFIG_DIR: Path | None = None
-_CONFIG_FILES = ("settings.json", "state.json", "ores_override.json")
+# every file kept in the config dir - used for one-time migration when the
+# config location moves between the portable (beside-exe) and AppData layouts
+_CONFIG_FILES = ("settings.json", "state.json", "ores_override.json",
+                 "ledger.json", "prices.json")
+
+
+def _migrate_config(src: Path, dst: Path) -> None:
+    """Copy any config files present in `src` into `dst`, never overwriting."""
+    if not src.is_dir() or src.resolve() == dst.resolve():
+        return
+    import shutil
+    for f in _CONFIG_FILES:
+        s = src / f
+        if s.exists() and not (dst / f).exists():
+            try:
+                shutil.copy2(s, dst / f)
+            except OSError:
+                pass
 
 
 def config_dir() -> Path:
-    """Config lives BESIDE THE EXE (portable). Falls back to APPDATA when
-    that folder isn't writable. Existing APPDATA config is migrated (copied)
-    the first time, so nothing is lost."""
+    """Where settings / state / ledger live.
+
+    Installed and packaged builds keep config in %APPDATA%\\OreHoldWatcher,
+    OUTSIDE the program folder, so the folder-swap updater and the uninstaller
+    never touch user data. Source runs stay portable (beside the source tree)
+    for convenient dev. A one-time migration copies any config found in the
+    other location, so nothing is lost when the layout changes."""
     global _CONFIG_DIR
     if _CONFIG_DIR is not None:
         return _CONFIG_DIR
-    portable = app_base_dir()
-    if _writable(portable):
-        d = portable
-        old = _appdata_dir()
-        if old.is_dir() and not (d / "settings.json").exists():
-            import shutil
-            for f in _CONFIG_FILES:
-                src = old / f
-                if src.exists() and not (d / f).exists():
-                    try:
-                        shutil.copy2(src, d / f)
-                    except OSError:
-                        pass
+    appdata = _appdata_dir()
+    beside = app_base_dir()
+    if is_frozen() or is_packaged():
+        appdata.mkdir(parents=True, exist_ok=True)
+        d = appdata
+        _migrate_config(beside, d)      # honor a portable config placed by hand
+    elif _writable(beside):
+        d = beside
+        _migrate_config(appdata, d)     # pick up any prior AppData config once
     else:
-        d = _appdata_dir()
-        d.mkdir(parents=True, exist_ok=True)
+        appdata.mkdir(parents=True, exist_ok=True)
+        d = appdata
     _CONFIG_DIR = d
     return d
 
@@ -624,17 +641,133 @@ def app_version_str() -> str:
     return f"v{v}" if v else f"v{APP_VERSION} (source)"
 
 
+_EXE_NAME = "OreHoldWatcher.exe"
+
+
+def install_dir() -> Path:
+    """Folder holding the running executable - the thing an update replaces."""
+    return Path(sys.executable).resolve().parent
+
+
+def can_write_install_dir() -> bool:
+    """False when the program folder needs elevation we never request (e.g. a
+    machine-wide Program Files install). Then an in-place update is impossible
+    and we point the user at a reinstall instead of failing silently."""
+    try:
+        probe = install_dir() / ".upd_write_test"
+        probe.write_text("x", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+# Written into <install>\update\apply_update.ps1 to finish an update after we
+# exit. Mirrors the new program folder over the old one, prunes files an older
+# version left behind (protecting the Inno uninstaller + this log), relaunches,
+# then deletes its own staging folder. Ported from eve-strait's proven model.
+_SWAP_PS1 = r"""# Written by Ore Hold Watcher to finish an update. Do not run by hand.
+param([string]$Src, [string]$Dst, [string]$ExeName)
+
+$exe = Join-Path $Dst $ExeName
+$log = Join-Path $Dst 'update-log.txt'
+function Log($m) {
+    "{0} {1}" -f (Get-Date -Format s), $m | Out-File $log -Append -Encoding utf8
+}
+Log "updater started: '$Src' -> '$Dst'"
+
+# Do NOT wait on a PID. The reliable signal that the app has exited is the
+# executable becoming writable again, so poll the lock itself.
+$unlocked = $false
+for ($i = 0; $i -lt 90; $i++) {
+    try {
+        $fs = [System.IO.File]::Open($exe, 'Open', 'Write', 'None')
+        $fs.Close()
+        $unlocked = $true
+        Log "exe unlocked after $i attempt(s)"
+        break
+    } catch {
+        Start-Sleep -Milliseconds 1000
+    }
+}
+
+if (-not $unlocked) {
+    Log "gave up waiting for the exe to unlock; install left untouched"
+    Start-Process -FilePath $exe
+    exit 1
+}
+
+# Copy natively rather than shelling out to robocopy: no external dependency
+# and no argument-quoting surprises.
+$srcRoot = (Resolve-Path -LiteralPath $Src).Path.TrimEnd('\')
+$dstRoot = (Resolve-Path -LiteralPath $Dst).Path.TrimEnd('\')
+$copied = 0
+try {
+    Get-ChildItem -LiteralPath $srcRoot -Recurse -File | ForEach-Object {
+        $rel = $_.FullName.Substring($srcRoot.Length).TrimStart('\')
+        $target = Join-Path $dstRoot $rel
+        $dir = Split-Path $target -Parent
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        Copy-Item -LiteralPath $_.FullName -Destination $target -Force -ErrorAction Stop
+        $copied++
+    }
+} catch {
+    Log "copy failed after $copied file(s): $_"
+    Log "relaunching the existing build; the download is kept for a retry"
+    Start-Process -FilePath $exe
+    exit 1
+}
+Log "copied $copied file(s)"
+
+# Prune files an older version left behind, but never the staging folder we are
+# running from, the Inno Setup uninstaller, or this log.
+$fresh = @{}
+Get-ChildItem -LiteralPath $srcRoot -Recurse -File | ForEach-Object {
+    $fresh[$_.FullName.Substring($srcRoot.Length).TrimStart('\').ToLower()] = $true
+}
+$protected = @('unins000.exe', 'unins000.dat', 'update-log.txt')
+$removed = 0
+Get-ChildItem -LiteralPath $dstRoot -Recurse -File |
+    Where-Object { -not $_.FullName.StartsWith($srcRoot, 'OrdinalIgnoreCase') } |
+    Where-Object { -not $_.FullName.StartsWith((Join-Path $dstRoot 'update'), 'OrdinalIgnoreCase') } |
+    ForEach-Object {
+        $rel = $_.FullName.Substring($dstRoot.Length).TrimStart('\')
+        if (-not $fresh.ContainsKey($rel.ToLower()) -and
+                $protected -notcontains $_.Name) {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+            $removed++
+        }
+    }
+Log "pruned $removed stale file(s)"
+
+Log "starting '$exe'"
+Start-Process -FilePath $exe
+
+# Clean up the staging folders from outside them.
+Start-Sleep -Milliseconds 500
+try { Remove-Item -LiteralPath $Src -Recurse -Force -ErrorAction Stop; Log "download folder removed" }
+catch { Log "could not remove download folder: $_" }
+"""
+
+
 class Updater:
-    """Checks GitHub releases, downloads the new exe, swaps it in place.
-    Network work runs in daemon threads; the UI polls the fields."""
+    """Checks GitHub releases for a newer -win64.zip, downloads it, and swaps
+    the whole program folder in place via a detached PowerShell helper. Network
+    work runs in daemon threads; the UI polls the fields.
+
+    Folder swap, not exe swap: the shipped artifact is a Nuitka --standalone
+    program folder (onefile tripped AV dropper heuristics), so an update is
+    'download the new folder, mirror it over the old one, relaunch'."""
 
     def __init__(self, settings: Settings):
         self.s = settings
         self.busy = False
-        self.available: dict | None = None   # {"version", "url"}
+        self.available: dict | None = None   # {"version", "url", "current"}
         self.up_to_date: str | None = None   # latest tag when already current
         self.error: str | None = None
-        self.downloaded: str | None = None   # path of the fetched .new file
+        self.downloaded: str | None = None   # path of the fetched update .zip
         self.manual = False
 
     def repo(self) -> str:
@@ -645,7 +778,7 @@ class Updater:
 
     def can_update(self) -> bool:
         return (bool(self.repo()) and is_frozen() and sys.platform == "win32"
-                and not is_packaged())
+                and not is_packaged() and can_write_install_dir())
 
     # -- phase 1: check ------------------------------------------------------
     def check_async(self, manual: bool = False):
@@ -664,8 +797,10 @@ class Updater:
             with urllib.request.urlopen(req, timeout=15) as r:
                 data = json.loads(r.read().decode("utf-8"))
             tag = str(data.get("tag_name", ""))
+            # the portable program-folder zip; keep "win" in the asset name
             asset = next((a for a in data.get("assets", [])
-                          if a.get("name", "").lower().endswith(".exe")), None)
+                          if a.get("name", "").lower().endswith(".zip")
+                          and "win" in a.get("name", "").lower()), None)
             cur = current_exe_version() or "0"
             log.info("update check: current=%s latest=%s", cur, tag)
             if asset and parse_ver(tag) > parse_ver(cur):
@@ -689,8 +824,10 @@ class Updater:
                          daemon=True).start()
 
     def _download(self, url: str):
+        import tempfile
         try:
-            dest = sys.executable + ".new"
+            base = Path(tempfile.mkdtemp(prefix="orewatcher-update-"))
+            dest = base / "update.zip"
             req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
             with urllib.request.urlopen(req, timeout=300) as r, \
                     open(dest, "wb") as f:
@@ -699,11 +836,11 @@ class Updater:
                     if not chunk:
                         break
                     f.write(chunk)
-            if os.path.getsize(dest) < 5_000_000:  # sanity: a real exe is big
+            if dest.stat().st_size < 1_000_000:  # sanity: the folder zip is big
                 raise ValueError("downloaded file suspiciously small")
-            self.downloaded = dest
+            self.downloaded = str(dest)
             log.info("update downloaded: %s (%d bytes)", dest,
-                     os.path.getsize(dest))
+                     dest.stat().st_size)
         except Exception as e:
             log.warning("update download failed: %s", e)
             self.error = str(e)
@@ -711,78 +848,61 @@ class Updater:
             self.busy = False
 
     # -- phase 3: swap + restart ---------------------------------------------
-    def apply(self) -> bool:
-        """Write a swap script that replaces the exe once it unlocks, then
-        relaunches it. Caller must quit right after.
+    def _extract(self, zip_path: Path) -> Path:
+        """Unpack the zip and return the folder that holds the executable
+        (the zip usually nests the program folder one level deep)."""
+        import zipfile
+        out = zip_path.parent / "unpacked"
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(out)
+        if (out / _EXE_NAME).exists():
+            return out
+        for child in out.rglob(_EXE_NAME):
+            return child.parent
+        raise RuntimeError(f"{_EXE_NAME} not found in the downloaded archive")
 
-        Design notes (each fixes a real failure seen in the wild):
-        - No PID wait: a onefile exe's payload PID (os.getpid) isn't the
-          process holding the .exe lock, so waiting on it is unreliable.
-          Instead the script just retries `move` until the file is
-          replaceable - the lock releasing IS the "app has exited" signal.
-        - `ping` for delays, not `timeout`: `timeout` aborts without a
-          console.
-        - Launched with CREATE_BREAKAWAY_FROM_JOB so it escapes the job
-          object a onefile exe puts the app in - otherwise the script is
-          killed the instant the app closes (its job closes with it).
-        - Writes update-log.txt next to the exe so a failed swap is
-          diagnosable."""
+    def apply(self) -> bool:
+        """Extract the new folder, launch the detached swap helper, and return
+        True so the caller can quit. The helper waits for our exe to unlock,
+        mirrors the new folder over the install dir, and relaunches.
+
+        Launched with CREATE_BREAKAWAY_FROM_JOB so the helper survives the app
+        exiting (a Nuitka onefile put the app in a job object; a standalone
+        build usually does not, but breaking away is harmless either way)."""
         if not self.downloaded:
             return False
         import subprocess
-        exe = sys.executable
-        new = self.downloaded
-        bat = exe + ".update.bat"
-        logf = exe + ".update-log.txt"
-        sleep1 = "ping -n 2 127.0.0.1 >nul"
-        script = f"""@echo off
-setlocal enableextensions
-set "LOG={logf}"
-echo [%date% %time%] updater started, replacing "{exe}" > "%LOG%"
-{sleep1}
-set /a tries=0
-:swap
-move /y "{new}" "{exe}" >>"%LOG%" 2>&1
-if not errorlevel 1 (
-    echo [%date% %time%] move succeeded after %tries% retries >> "%LOG%"
-    goto relaunch
-)
-set /a tries+=1
-if %tries% geq 60 (
-    echo [%date% %time%] gave up after %tries% retries; relaunching existing >> "%LOG%"
-    goto relaunch
-)
-{sleep1}
-goto swap
-:relaunch
-echo [%date% %time%] starting "{exe}" >> "%LOG%"
-start "" "{exe}"
-echo [%date% %time%] done >> "%LOG%"
-del "%~f0"
-"""
         try:
-            with open(bat, "w", encoding="ascii") as f:
-                f.write(script)
+            new_dir = self._extract(Path(self.downloaded))
+        except Exception as e:
+            log.warning("update extract failed: %s", e)
+            self.error = str(e)
+            return False
+        target = install_dir()
+        script = target / "update" / "apply_update.ps1"
+        try:
+            script.parent.mkdir(parents=True, exist_ok=True)
+            script.write_text(_SWAP_PS1, encoding="utf-8")
         except OSError as e:
             log.warning("could not write update script: %s", e)
+            self.error = str(e)
             return False
 
+        args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-WindowStyle", "Hidden", "-File", str(script),
+                "-Src", str(new_dir), "-Dst", str(target),
+                "-ExeName", _EXE_NAME]
         DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0x8)
         NEWGROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
         BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x1000000)
-        launched = False
-        # try to break away from the onefile job object first; if the job
-        # forbids breakaway, CreateProcess errors - fall back without it
         for flags in (DETACHED | NEWGROUP | BREAKAWAY, DETACHED | NEWGROUP):
             try:
-                subprocess.Popen(["cmd", "/c", bat], creationflags=flags,
-                                 close_fds=True)
-                launched = True
-                log.info("update swap script launched (flags=0x%x)", flags)
-                break
+                subprocess.Popen(args, creationflags=flags, close_fds=True)
+                log.info("update swap helper launched (flags=0x%x)", flags)
+                return True
             except OSError as e:
                 log.warning("update launch failed (flags=0x%x): %s", flags, e)
-        return launched
+        return False
 
 
 class DarkDialog(QDialog):
@@ -2585,6 +2705,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, "Updates", "Running from source - update by pulling "
                 "the repo. Auto-update only applies to the built exe.")
+            return
+        if not can_write_install_dir():
+            QMessageBox.information(
+                self, "Updates", "This install lives in a folder that needs "
+                "administrator rights to change, so the in-app updater can't "
+                "apply updates here. Download the latest release and reinstall "
+                "to update.")
             return
         self.updater.check_async(manual=True)
 

@@ -19,7 +19,7 @@ jobs:
       - run: python test_engine.py
 
   build-exe:
-    name: Build Windows exe (Nuitka)
+    name: Build Windows folder (Nuitka standalone)
     needs: test
     runs-on: windows-latest
     steps:
@@ -40,11 +40,13 @@ jobs:
           key: nuitka-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
           restore-keys: nuitka-${{ runner.os }}-
 
+      # standalone (folder), matching what we ship - a onefile smoke build would
+      # not exercise the same artifact and trips AV heuristics anyway
       - name: Build
         shell: pwsh
         run: |
           python -m nuitka `
-            --onefile `
+            --standalone `
             --assume-yes-for-downloads `
             --enable-plugin=pyside6 `
             --windows-console-mode=disable `
@@ -56,9 +58,12 @@ jobs:
             --output-filename=OreHoldWatcher.exe `
             --output-dir=build `
             app.py
+          if (-not (Test-Path "build\app.dist\OreHoldWatcher.exe")) {
+            throw "standalone build missing OreHoldWatcher.exe"
+          }
 
       - uses: actions/upload-artifact@v4
         with:
           name: OreHoldWatcher-${{ github.sha }}
-          path: build/OreHoldWatcher.exe
+          path: build/app.dist
           if-no-files-found: error

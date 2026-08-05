@@ -39,14 +39,33 @@ and the folder path is masked.)*
 2. Double-click `run.bat`. The first run creates a virtualenv, installs
    PySide6 and winotify, then launches straight to the tray and window.
 
-## Build a standalone exe
+## Install (Windows)
 
-Double-click `build.bat`. It installs Nuitka into the venv and compiles
-`build\OreHoldWatcher.exe` as a single file with no console window. The
-first build takes several minutes and needs no key presses.
+Grab the latest [release](https://github.com/littlephish/ore-hold-watcher/releases):
+
+- **Installer** - `Ore Hold Watcher-<ver>-setup.exe`. Per-user install (no UAC
+  prompt), adds Start-menu/optional desktop shortcuts, and updates itself
+  in-app. Recommended.
+- **Portable zip** - `OreHoldWatcher-<ver>-win64.zip`. Unzip anywhere and run
+  `OreHoldWatcher.exe`; no install. It still self-updates as long as its folder
+  is writable.
+
+Both ship a Nuitka **standalone program folder**, not a single .exe: a onefile
+build unpacks itself to `%TEMP%` and runs from there, which Defender and
+CrowdStrike flag as dropper behaviour. The folder form avoids that and is what
+makes the in-app updater possible.
 
 To start it with Windows: press `Win+R`, type `shell:startup`, and drop a
-shortcut to the exe (or `run.bat`) in that folder.
+shortcut to `OreHoldWatcher.exe` in that folder.
+
+## Build it yourself
+
+Double-click `build.bat`. It installs Nuitka into the venv and compiles a
+standalone folder, then stages `dist\OreHoldWatcher\` plus a portable zip (and
+the installer too, if [Inno Setup](https://jrsoftware.org/isinfo.php) is
+installed - `winget install JRSoftware.InnoSetup`). The first build takes
+several minutes and needs no key presses. There's also an MSIX build
+([packaging/README.md](packaging/README.md)) as a third distribution option.
 
 ## How it works
 
@@ -346,49 +365,56 @@ emergency-warp handling, which is the point of doing it before shutdown.
 
 ## Auto-update
 
-The built exe updates itself from GitHub, from the fixed repo
-`littlephish/ore-hold-watcher`. Leave "Check GitHub for app updates"
-ticked and it works out of the box. The app checks the latest release
-20 seconds after launch and daily after that; the tray menu also has
-"Check for updates" for an on-demand check. When you accept an update it
-downloads the new exe, waits for this process to fully exit, then swaps
-the file in (retrying briefly if a onefile exe or antivirus still holds a
-lock) and relaunches.
+The installed and portable-zip builds update themselves from GitHub, from the
+fixed repo `littlephish/ore-hold-watcher`. Leave "Check GitHub for app updates"
+ticked and it works out of the box. The app checks the latest release 20
+seconds after launch and daily after that; the tray menu also has "Check for
+updates" for an on-demand check.
 
-When a newer version exists you get a dialog showing both versions with
-three choices: **Update now** downloads the new exe, shows a "restarting"
-notice, then swaps it in and relaunches (your settings and state are
-untouched - they live beside the exe and aren't part of the download);
-**Later** dismisses and asks again next launch; **Skip this version**
-never asks about that version again. A manual "Check for updates" from the
-tray always shows the dialog, even for a version you skipped.
+Because the app ships as a program folder, an update is a **folder swap**, not
+an exe swap: it downloads the new `-win64.zip`, and on your OK a small detached
+PowerShell helper waits for this process to exit, mirrors the new folder over
+the install folder (pruning files old versions left behind but keeping the Inno
+uninstaller), then relaunches. Your settings, state and ledger are untouched -
+they live in `%APPDATA%\OreHoldWatcher`, outside the program folder, so neither
+an update nor an uninstall can disturb them.
 
-Version comparison uses the version stamped into the exe by
-`release.yml`, so it only works for exes built from a tag. Running from
-source? The updater stays out of the way: update with `git pull`.
+When a newer version exists you get a dialog showing both versions with three
+choices: **Update now**, **Later** (asks again next launch), or **Skip this
+version** (never asks about it again). A manual "Check for updates" always shows
+the dialog, even for a skipped version.
+
+Version comparison uses the version stamped into the exe by `release.yml`, so it
+only works for builds made from a tag. The updater turns itself off when it
+can't apply an update: running from source (use `git pull`), running the MSIX
+build (Windows manages that), or when the program folder isn't writable (a
+machine-wide install - reinstall the newer release instead).
 
 ## CI and releases (GitHub)
 
-Push this folder to a GitHub repo and two workflows take over:
+Push this folder to a GitHub repo and the workflows take over:
 
-- `ci.yml` runs the engine tests on Linux for every push and PR, then
-  builds the Windows exe with Nuitka and uploads it as a build artifact.
-- `release.yml` triggers on a version tag, builds a version-stamped exe,
-  and publishes a GitHub Release with `OreHoldWatcher.exe` attached:
+- `ci.yml` runs the engine tests on Linux for every push and PR.
+- `release.yml` triggers on a version tag: it builds a version-stamped Nuitka
+  **standalone** folder and publishes a GitHub Release with both the portable
+  `OreHoldWatcher-<ver>-win64.zip` and the `Ore Hold Watcher-<ver>-setup.exe`
+  Inno Setup installer attached:
 
       git tag v1.0.0
       git push origin v1.0.0
 
-Both are non-interactive. The first CI build is slow; later ones reuse the
-Nuitka compilation cache.
+- `msix.yml` optionally builds a signed MSIX (see [packaging/README.md](packaging/README.md)).
+
+All are non-interactive. The first build is slow; later ones reuse the Nuitka
+compilation cache.
 
 ## Files it writes
 
-Config lives beside the exe (or beside `app.py` when running from source).
-The old `%APPDATA%\OreHoldWatcher\` location is still checked on every
-startup: anything found there and missing here is copied over, and if the
-exe's folder is not writable the app keeps using APPDATA. All of these are
-in `.gitignore`:
+Installed and portable builds keep config in `%APPDATA%\OreHoldWatcher\`,
+outside the program folder, so updates and uninstalls never touch it. Running
+from source it stays portable (beside `app.py`). A one-time migration copies
+config found in the other location on first run, so nothing is lost across the
+move. All of these are in `.gitignore`:
 
 - `settings.json`: log folder, threshold, capacities, alert methods,
   downtime options, and `mining_patterns` (custom regexes with named
