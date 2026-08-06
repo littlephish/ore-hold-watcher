@@ -916,7 +916,7 @@ def fill_color(pct: float) -> str:
     return "#23a55a"       # green
 
 
-def make_tray_icon(pct: float) -> QIcon:
+def make_gauge_pixmap(pct: float) -> QPixmap:
     """Donut gauge colored by the fullest character."""
     size = 64
     pm = QPixmap(size, size)
@@ -936,7 +936,11 @@ def make_tray_icon(pct: float) -> QIcon:
     p.setFont(f)
     p.drawText(pm.rect(), Qt.AlignCenter, f"{int(round(min(pct, 99)))}")
     p.end()
-    return QIcon(pm)
+    return pm
+
+
+def make_tray_icon(pct: float) -> QIcon:
+    return QIcon(make_gauge_pixmap(pct))
 
 
 # ---------------------------------------------------------------------------
@@ -2306,7 +2310,7 @@ class MainWindow(QMainWindow):
         # rate-limited and only repaints tray/rows when values actually change
         self._last_refresh = 0.0
         self._tray_icon_key = None    # last pct the gauge was painted for
-        self._gauge_icon = None       # cached QIcon; rebuilt only on pct change
+        self._gauge_pixmap = None     # cached gauge; repainted only on pct change
         self._tray_tip = ""
         self._win_title = ""
         self._applied_order: list | None = None  # row order last laid out
@@ -2919,14 +2923,15 @@ class MainWindow(QMainWindow):
         icon_key = round(min(max_pct, 100.0), 1)
         if icon_key != self._tray_icon_key:
             self._tray_icon_key = icon_key
-            self._gauge_icon = make_tray_icon(max_pct)  # rebuild pixmap on change
-            self.tray.setIcon(self._gauge_icon)         # tray: pricey shell call
-        # The taskbar icon is dropped whenever the native window is recreated
-        # (e.g. the always-on-top toggle in apply_on_top), so re-assert it
-        # cheaply on every visible refresh - setWindowIcon is a light WM_SETICON,
-        # not the pixmap repaint we cached above.
-        if self._gauge_icon is not None and self.isVisible():
-            self.setWindowIcon(self._gauge_icon)
+            self._gauge_pixmap = make_gauge_pixmap(max_pct)  # repaint on change
+            self.tray.setIcon(QIcon(self._gauge_pixmap))     # tray: shell call
+        # Windows 11's taskbar button ignores a repeated identical QIcon and
+        # drops the icon when the native window is recreated (always-on-top
+        # toggle). Push a FRESH QIcon from the cached pixmap every visible
+        # refresh so the taskbar actually repaints - cheap (no re-paint), and
+        # only while the window is shown.
+        if self._gauge_pixmap is not None and self.isVisible():
+            self.setWindowIcon(QIcon(self._gauge_pixmap))
         title = f"{APP_NAME} - {max_pct:.0f}%" if chars else APP_NAME
         if title != self._win_title:
             self._win_title = title
