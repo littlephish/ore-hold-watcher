@@ -1,8 +1,8 @@
 name: CI
 
-# Lightweight checks only: byte-compile every module and run the engine tests.
-# No packaging here - the Windows folder/zip/installer is built by release.yml
-# on version tags.
+# Lightweight checks only: byte-compile the Python, run the engine tests, and
+# compile-check the Rust updater. No packaging here - the Windows
+# folder/zip/installer is built by release.yml on version tags.
 on:
   push:
     branches: [main, master]
@@ -24,3 +24,22 @@ jobs:
       # engine/parser tests are pure stdlib
       - name: Engine tests
         run: python test_engine.py
+
+  updater:
+    name: Updater compiles (Rust)
+    runs-on: windows-latest   # matches the real target (crt-static, MSVC)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            updater/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('updater/Cargo.toml', 'updater/src/**') }}
+          restore-keys: cargo-${{ runner.os }}-
+      # cargo ships preinstalled on windows-latest; build links it (catches the
+      # crt-static / windows_subsystem link path, not just type errors)
+      - name: cargo build
+        run: cargo build --manifest-path updater/Cargo.toml
