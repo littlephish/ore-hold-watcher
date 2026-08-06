@@ -662,93 +662,37 @@ def can_write_install_dir() -> bool:
         return False
 
 
-# Written into <install>\update\apply_update.ps1 to finish an update after we
-# exit. Mirrors the new program folder over the old one, prunes files an older
-# version left behind (protecting the Inno uninstaller + this log), relaunches,
-# then deletes its own staging folder. Ported from eve-strait's proven model.
-_SWAP_PS1 = r"""# Written by Ore Hold Watcher to finish an update. Do not run by hand.
-param([string]$Src, [string]$Dst, [string]$ExeName)
-
-$exe = Join-Path $Dst $ExeName
-$log = Join-Path $Dst 'update-log.txt'
-function Log($m) {
-    "{0} {1}" -f (Get-Date -Format s), $m | Out-File $log -Append -Encoding utf8
-}
-Log "updater started: '$Src' -> '$Dst'"
-
-# Do NOT wait on a PID. The reliable signal that the app has exited is the
-# executable becoming writable again, so poll the lock itself.
-$unlocked = $false
-for ($i = 0; $i -lt 90; $i++) {
-    try {
-        $fs = [System.IO.File]::Open($exe, 'Open', 'Write', 'None')
-        $fs.Close()
-        $unlocked = $true
-        Log "exe unlocked after $i attempt(s)"
-        break
-    } catch {
-        Start-Sleep -Milliseconds 1000
-    }
-}
-
-if (-not $unlocked) {
-    Log "gave up waiting for the exe to unlock; install left untouched"
-    Start-Process -FilePath $exe
-    exit 1
-}
-
-# Copy natively rather than shelling out to robocopy: no external dependency
-# and no argument-quoting surprises.
-$srcRoot = (Resolve-Path -LiteralPath $Src).Path.TrimEnd('\')
-$dstRoot = (Resolve-Path -LiteralPath $Dst).Path.TrimEnd('\')
-$copied = 0
-try {
-    Get-ChildItem -LiteralPath $srcRoot -Recurse -File | ForEach-Object {
-        $rel = $_.FullName.Substring($srcRoot.Length).TrimStart('\')
-        $target = Join-Path $dstRoot $rel
-        $dir = Split-Path $target -Parent
-        if (-not (Test-Path -LiteralPath $dir)) {
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        }
-        Copy-Item -LiteralPath $_.FullName -Destination $target -Force -ErrorAction Stop
-        $copied++
-    }
-} catch {
-    Log "copy failed after $copied file(s): $_"
-    Log "relaunching the existing build; the download is kept for a retry"
-    Start-Process -FilePath $exe
-    exit 1
-}
-Log "copied $copied file(s)"
-
-# Prune files an older version left behind, but never the staging folder we are
-# running from, the Inno Setup uninstaller, or this log.
-$fresh = @{}
-Get-ChildItem -LiteralPath $srcRoot -Recurse -File | ForEach-Object {
-    $fresh[$_.FullName.Substring($srcRoot.Length).TrimStart('\').ToLower()] = $true
-}
-$protected = @('unins000.exe', 'unins000.dat', 'update-log.txt')
-$removed = 0
-Get-ChildItem -LiteralPath $dstRoot -Recurse -File |
-    Where-Object { -not $_.FullName.StartsWith($srcRoot, 'OrdinalIgnoreCase') } |
-    Where-Object { -not $_.FullName.StartsWith((Join-Path $dstRoot 'update'), 'OrdinalIgnoreCase') } |
-    ForEach-Object {
-        $rel = $_.FullName.Substring($dstRoot.Length).TrimStart('\')
-        if (-not $fresh.ContainsKey($rel.ToLower()) -and
-                $protected -notcontains $_.Name) {
-            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-            $removed++
-        }
-    }
-Log "pruned $removed stale file(s)"
-
-Log "starting '$exe'"
-Start-Process -FilePath $exe
-
-# Clean up the staging folders from outside them.
-Start-Sleep -Milliseconds 500
-try { Remove-Item -LiteralPath $Src -Recurse -Force -ErrorAction Stop; Log "download folder removed" }
-catch { Log "could not remove download folder: $_" }
+# Written to a NO-SPACES temp folder and run by cmd.exe to finish an update
+# after we exit. Deliberately cmd + robocopy, NOT PowerShell: a machine
+# ExecutionPolicy of AllSigned/Restricted (locked-down or corporate machines)
+# overrides -ExecutionPolicy Bypass and silently refuses to run an unsigned
+# .ps1 - the swap simply never happens and no log is written. Batch has no such
+# gate. robocopy /MIR mirrors the new program folder over the install dir and
+# removes files an older version left behind; the excludes protect the Inno
+# uninstaller, this log, and any stale staging folder. The install path (which
+# contains spaces - "Ore Hold Watcher") is passed as a quoted arg and read via
+# %~2, so spaces are safe. Args: %1=src folder  %2=install dir  %3=exe name.
+# It ALWAYS relaunches the exe at the end, even if robocopy reported problems,
+# so the app never fails to come back up.
+_SWAP_BAT = r"""@echo off
+setlocal enableextensions
+cd /d "%TEMP%"
+set "SRC=%~1"
+set "DST=%~2"
+set "EXE=%~3"
+set "LOG=%DST%\update-log.txt"
+echo [%date% %time%] updater started: "%SRC%" to "%DST%" > "%LOG%"
+rem give the app a moment to exit so its files unlock (robocopy also retries)
+ping -n 3 127.0.0.1 >nul
+rem mirror the new build over the install; /R:60 /W:1 retries files still held
+rem by a slow exit; excludes protect the uninstaller, this log and old staging
+robocopy "%SRC%" "%DST%" /MIR /XD "%DST%\update" /XF unins000.exe unins000.dat update-log.txt /R:60 /W:1 >> "%LOG%" 2>&1
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] robocopy exit %RC% >> "%LOG%"
+if %RC% GEQ 8 echo [%date% %time%] WARNING: robocopy reported errors (see above) >> "%LOG%"
+echo [%date% %time%] starting "%DST%\%EXE%" >> "%LOG%"
+start "" "%DST%\%EXE%"
+echo [%date% %time%] done >> "%LOG%"
 """
 
 
@@ -861,17 +805,37 @@ class Updater:
             return child.parent
         raise RuntimeError(f"{_EXE_NAME} not found in the downloaded archive")
 
+    @staticmethod
+    def _spawn_detached(args: list[str]) -> bool:
+        """Launch a helper fully detached so it survives our exit."""
+        import subprocess
+        DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0x8)
+        NEWGROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+        BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x1000000)
+        for flags in (DETACHED | NEWGROUP | BREAKAWAY, DETACHED | NEWGROUP):
+            try:
+                subprocess.Popen(args, creationflags=flags, close_fds=True)
+                log.info("update helper launched: %s (flags=0x%x)",
+                         args[0], flags)
+                return True
+            except OSError as e:
+                log.warning("update launch failed (flags=0x%x): %s", flags, e)
+        return False
+
     def apply(self) -> bool:
-        """Extract the new folder, launch the detached swap helper, and return
+        """Unpack the new build and launch the detached swap helper, returning
         True so the caller can quit. The helper waits for our exe to unlock,
         mirrors the new folder over the install dir, and relaunches.
 
-        Launched with CREATE_BREAKAWAY_FROM_JOB so the helper survives the app
-        exiting (a Nuitka onefile put the app in a job object; a standalone
-        build usually does not, but breaking away is harmless either way)."""
+        Preferred helper is the bundled Rust update.exe, run from a temp COPY
+        so it can overwrite the whole install (including update.exe itself)
+        with no interpreter and no self-replace problem. Older installs that
+        predate update.exe fall back to a cmd/robocopy batch. Either way the
+        helper lives in the no-spaces temp dir and the install path is passed
+        as a quoted arg, so 'Ore Hold Watcher' spaces are safe."""
         if not self.downloaded:
             return False
-        import subprocess
+        import shutil
         try:
             new_dir = self._extract(Path(self.downloaded))
         except Exception as e:
@@ -879,30 +843,32 @@ class Updater:
             self.error = str(e)
             return False
         target = install_dir()
-        script = target / "update" / "apply_update.ps1"
+        tmp = Path(self.downloaded).parent
+
+        # preferred: the bundled static update.exe (copied out of the install so
+        # it can replace its own installed copy)
+        updater = target / "update.exe"
+        if updater.exists():
+            try:
+                tmp_exe = tmp / "update.exe"
+                shutil.copy2(updater, tmp_exe)
+                if self._spawn_detached(
+                        [str(tmp_exe), str(new_dir), str(target), _EXE_NAME]):
+                    return True
+            except OSError as e:
+                log.warning("update.exe helper failed, falling back to cmd: %s",
+                            e)
+
+        # fallback: cmd/robocopy (no PowerShell -> immune to execution policy)
+        bat = tmp / "apply_update.bat"
         try:
-            script.parent.mkdir(parents=True, exist_ok=True)
-            script.write_text(_SWAP_PS1, encoding="utf-8")
+            bat.write_text(_SWAP_BAT, encoding="ascii")
         except OSError as e:
-            log.warning("could not write update script: %s", e)
+            log.warning("could not write fallback update script: %s", e)
             self.error = str(e)
             return False
-
-        args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                "-WindowStyle", "Hidden", "-File", str(script),
-                "-Src", str(new_dir), "-Dst", str(target),
-                "-ExeName", _EXE_NAME]
-        DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0x8)
-        NEWGROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
-        BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x1000000)
-        for flags in (DETACHED | NEWGROUP | BREAKAWAY, DETACHED | NEWGROUP):
-            try:
-                subprocess.Popen(args, creationflags=flags, close_fds=True)
-                log.info("update swap helper launched (flags=0x%x)", flags)
-                return True
-            except OSError as e:
-                log.warning("update launch failed (flags=0x%x): %s", flags, e)
-        return False
+        return self._spawn_detached(
+            ["cmd", "/c", str(bat), str(new_dir), str(target), _EXE_NAME])
 
 
 class DarkDialog(QDialog):

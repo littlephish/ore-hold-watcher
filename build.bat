@@ -53,6 +53,21 @@ if not exist dist mkdir dist
 if exist "dist\OreHoldWatcher" rmdir /s /q "dist\OreHoldWatcher"
 xcopy /e /i /y "build\app.dist" "dist\OreHoldWatcher" >nul
 
+rem static, dependency-free update.exe (Rust) - shipped inside the folder
+where cargo >nul 2>&1
+if %errorlevel%==0 (
+    cargo build --release --manifest-path updater\Cargo.toml
+    if exist "updater\target\release\update.exe" (
+        copy /y "updater\target\release\update.exe" "dist\OreHoldWatcher\update.exe" >nul
+    ) else (
+        echo WARNING: cargo build produced no update.exe - shipping without it.
+    )
+) else (
+    echo.
+    echo Rust/cargo not found - the in-app updater ^(update.exe^) will be omitted.
+    echo Install Rust from https://rustup.rs to include it.
+)
+
 rem portable zip (name contains "win" so the in-app updater picks it up)
 set "ZIP=dist\OreHoldWatcher-%VER%-win64.zip"
 if exist "%ZIP%" del /q "%ZIP%"

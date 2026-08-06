@@ -18,6 +18,9 @@ build/
 dist/
 *.exe
 
+# rust updater build output
+updater/target/
+
 # auto-update leftovers
 update/
 update-log.txt

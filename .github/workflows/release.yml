@@ -80,6 +80,17 @@ jobs:
             --output-filename=OreHoldWatcher.exe `
             app.py
 
+      # Static, dependency-free update.exe (Rust). cargo ships preinstalled on
+      # windows-latest. Shipped inside the program folder; the app copies it to
+      # temp and runs it to apply updates without PowerShell/execution-policy.
+      - name: Build updater (Rust)
+        shell: pwsh
+        run: |
+          cargo build --release --manifest-path updater\Cargo.toml
+          if (-not (Test-Path "updater\target\release\update.exe")) {
+            throw "cargo did not produce update.exe"
+          }
+
       - name: Stage the program folder
         shell: pwsh
         run: |
@@ -87,8 +98,12 @@ jobs:
           if (-not $dist) { throw "Nuitka produced no program folder" }
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item $dist.FullName dist\OreHoldWatcher -Recurse
+          Copy-Item updater\target\release\update.exe dist\OreHoldWatcher\update.exe
           if (-not (Test-Path "dist\OreHoldWatcher\OreHoldWatcher.exe")) {
             throw "staged folder missing OreHoldWatcher.exe"
+          }
+          if (-not (Test-Path "dist\OreHoldWatcher\update.exe")) {
+            throw "staged folder missing update.exe"
           }
 
       # The updater looks for a *-win*.zip asset, so keep "win" in the name.
