@@ -1,2 +1,2 @@
-PySide6>=6.6
+PySide6>=6.11.1
 winotify>=1.1 ; sys_platform == 'win32'
