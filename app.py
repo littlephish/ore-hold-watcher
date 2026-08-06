@@ -48,6 +48,9 @@ from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
 
 APP_NAME = "Ore Hold Watcher"
 ORG_DIR = "OreHoldWatcher"
+# Stable Windows identity for the taskbar button and toast notifications, so
+# both behave the same however the app is launched (see set_app_user_model_id).
+APP_USER_MODEL_ID = "LittlePhish.OreHoldWatcher"
 DEFAULT_UPDATE_REPO = "littlephish/ore-hold-watcher"
 # Fallback version for source runs. The built exe carries the real version
 # stamped from the git tag by release.yml; that wins when available.
@@ -1017,7 +1020,7 @@ class Notifier:
     def _popup(self, title: str, body: str):
         if HAVE_WINOTIFY:
             try:
-                t = Notification(app_id=APP_NAME, title=title, msg=body)
+                t = Notification(app_id=APP_USER_MODEL_ID, title=title, msg=body)
                 t.show()
                 return
             except Exception as e:
@@ -3022,6 +3025,22 @@ class MainWindow(QMainWindow):
             else "color: #949ba4;")
 
 
+def set_app_user_model_id() -> None:
+    """Give the process a stable taskbar identity. Without this Windows guesses
+    it from whoever launched us, so a build relaunched by the updater lands
+    under a different identity than one started from the Start menu - and in
+    that state Win11 shows the static exe icon on the taskbar instead of the
+    live gauge. Must run before any window is created."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            ctypes.c_wchar_p(APP_USER_MODEL_ID))
+    except Exception as e:
+        log.debug("set AppUserModelID failed: %s", e)
+
+
 def main():
     try:
         verbose = json.loads((config_dir() / "settings.json").read_text(
@@ -3032,6 +3051,7 @@ def main():
     log.info("=== Ore Hold Watcher starting (user=%s) ===", os.environ.get(
         "USERNAME") or os.environ.get("USER") or "?")
     log.info("config dir: %s", config_dir())
+    set_app_user_model_id()   # stable taskbar identity, before any window
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(APP_NAME)
