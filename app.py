@@ -827,12 +827,14 @@ class Updater:
         True so the caller can quit. The helper waits for our exe to unlock,
         mirrors the new folder over the install dir, and relaunches.
 
-        Preferred helper is the bundled Rust update.exe, run from a temp COPY
-        so it can overwrite the whole install (including update.exe itself)
-        with no interpreter and no self-replace problem. Older installs that
-        predate update.exe fall back to a cmd/robocopy batch. Either way the
-        helper lives in the no-spaces temp dir and the install path is passed
-        as a quoted arg, so 'Ore Hold Watcher' spaces are safe."""
+        Preferred helper is the Rust update.exe, run from a temp COPY so it can
+        overwrite the whole install (including update.exe itself) with no
+        interpreter and no self-replace problem. We take it from the NEWLY
+        DOWNLOADED build first, so a fix to the updater ships and takes effect
+        on the very same update; the currently-installed update.exe is the next
+        choice, and a cmd/robocopy batch the last resort. Either way the helper
+        runs from the no-spaces temp dir and the install path is passed as a
+        quoted arg, so 'Ore Hold Watcher' spaces are safe."""
         if not self.downloaded:
             return False
         import shutil
@@ -845,21 +847,23 @@ class Updater:
         target = install_dir()
         tmp = Path(self.downloaded).parent
 
-        # preferred: the bundled static update.exe (copied out of the install so
-        # it can replace its own installed copy)
-        updater = target / "update.exe"
-        if updater.exists():
+        # prefer the update.exe shipped INSIDE the new build (self-fixing), then
+        # the installed one; run from a temp copy so it can replace its own
+        # installed copy during the swap
+        for source in (new_dir / "update.exe", target / "update.exe"):
+            if not source.exists():
+                continue
             try:
                 tmp_exe = tmp / "update.exe"
-                shutil.copy2(updater, tmp_exe)
+                shutil.copy2(source, tmp_exe)
                 if self._spawn_detached(
                         [str(tmp_exe), str(new_dir), str(target), _EXE_NAME]):
                     return True
             except OSError as e:
-                log.warning("update.exe helper failed, falling back to cmd: %s",
-                            e)
+                log.warning("update.exe helper (%s) failed, trying next: %s",
+                            source, e)
 
-        # fallback: cmd/robocopy (no PowerShell -> immune to execution policy)
+        # last resort: cmd/robocopy (no PowerShell -> immune to execution policy)
         bat = tmp / "apply_update.bat"
         try:
             bat.write_text(_SWAP_BAT, encoding="ascii")
