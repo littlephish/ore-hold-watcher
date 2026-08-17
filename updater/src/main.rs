@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Jammy LLC
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 //! Generic in-place updater for folder-based Windows apps

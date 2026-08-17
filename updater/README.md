@@ -52,3 +52,11 @@ Nothing here is app-specific — the app name, install path, and exe name all co
 from argv. Copy this `updater/` folder into the other repo (or share the built
 `update.exe`), build it the same way, drop `update.exe` in the program folder,
 and have that app spawn it with its own exe name.
+
+## License
+
+MIT — Copyright (c) 2026 Jammy LLC. See [LICENSE](LICENSE).
+
+This folder is licensed independently of the parent repository. Ore Hold Watcher
+as a whole is GPLv3, but `updater/` is MIT-licensed Jammy LLC code that is reused
+across projects, so it can be copied into other apps under MIT terms alone.

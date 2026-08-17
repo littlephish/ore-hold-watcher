@@ -51,7 +51,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
-; The whole Nuitka standalone program folder.
+; The whole Nuitka standalone program folder. build.bat stages LICENSE.txt
+; (GPLv3, this app) and LICENSE-updater.txt (MIT, Jammy LLC - covers
+; update.exe) into that folder, so they are installed by this same line.
+; Don't add them to Excludes: both licenses require the notice to ship with
+; the binaries.
 Source: "..\dist\{#ArtifactName}\*"; Excludes: "update\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]

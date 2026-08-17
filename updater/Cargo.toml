@@ -3,7 +3,8 @@ name = "app-updater"
 version = "1.0.0"
 edition = "2021"
 description = "Generic in-place folder updater for Windows desktop apps"
-license = "GPL-3.0-or-later"
+authors = ["Jammy LLC"]
+license = "MIT"
 
 # Produces update.exe
 [[bin]]

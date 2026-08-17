@@ -473,6 +473,12 @@ it, but any distributed derivative must also be licensed under GPLv3 and ship
 its source. The license covers this app's code only; EVE Online and all CCP
 property remain CCP's, per the notice below.
 
+One exception: the [`updater/`](updater/) folder is **MIT**, Copyright (c) 2026
+Jammy LLC - see [updater/LICENSE](updater/LICENSE). It is a generic, app-agnostic
+updater reused across Jammy LLC projects and is not part of this app's GPLv3
+code. MIT is GPL-compatible, so distributed builds of Ore Hold Watcher as a whole
+remain GPLv3; the `updater/` sources on their own may be reused under MIT.
+
 This app bundles Qt (via PySide6, LGPLv3) in its packaged builds. Because the
 build is a plain program folder, the Qt libraries can be replaced by the user
 as LGPLv3 allows; a bundled copy of the third-party license notices is planned.
