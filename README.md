@@ -479,9 +479,13 @@ updater reused across Jammy LLC projects and is not part of this app's GPLv3
 code. MIT is GPL-compatible, so distributed builds of Ore Hold Watcher as a whole
 remain GPLv3; the `updater/` sources on their own may be reused under MIT.
 
+Packaged builds carry their notices in the program folder: `LICENSE.txt` (this
+app, GPLv3) and `LICENSE-updater.txt` (`update.exe`, MIT). Both the portable zip
+and the installer include them.
+
 This app bundles Qt (via PySide6, LGPLv3) in its packaged builds. Because the
 build is a plain program folder, the Qt libraries can be replaced by the user
-as LGPLv3 allows; a bundled copy of the third-party license notices is planned.
+as LGPLv3 allows; a bundled copy of the Qt license notices is still planned.
 
 ## CCP Developer License Agreement
 
