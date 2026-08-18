@@ -5,7 +5,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from engine import Engine, MiningEvent, HoldFullEvent, UnknownOreEvent, OreTable
+from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
+                    OreTable, ResidueEvent, ts_to_epoch)
 
 HEADER = (
     "------------------------------------------------------------\n"
@@ -41,6 +42,16 @@ LINES_B = HEADER.format(name="Nancy Kondur") + "\n".join([
     "[ 2026.07.15 12:01:30 ] (mining) You have successfully mined 5,000 units of <color=0xff00ff00>Golden Omber</color>",
 ]) + "\n"
 
+# Residue: depletes the asteroid but never enters the hold (spec F1).
+# The residue line carries no ore name and must pair with the tick above it.
+LINES_D = HEADER.format(name="Yuri Urt") + "\n".join([
+    "[ 2026.07.15 15:00:00 ] (mining) You mined 13 units of Brimful Coesite",
+    "[ 2026.07.15 15:00:00 ] (mining) Additional 13 units depleted from asteroid as residue",
+    "[ 2026.07.15 15:01:00 ] (mining) You mined 14 units of Brimful Coesite",
+    # >2s after any tick: unpaired, must be discarded
+    "[ 2026.07.15 15:05:30 ] (mining) Additional 99 units depleted from asteroid as residue",
+]) + "\n"
+
 
 def approx(a, b, tol=0.01):
     assert abs(a - b) < tol, f"{a} != {b}"
@@ -57,6 +68,9 @@ def main():
     # real-world format: markup-laden drone mining + compression, CRLF
     (tmp / "20260715_130645_2123973494.txt").write_bytes(
         b"\xef\xbb\xbf" + LINES_C.replace("\n", "\r\n").encode("utf-8"))
+    # residue lines (spec F1/F2)
+    (tmp / "20260715_150000_93333333.txt").write_bytes(
+        b"\xef\xbb\xbf" + LINES_D.encode("utf-8"))
 
     eng = Engine(log_dir=tmp, state_path=tmp / "state.json",
                  default_capacity=180000.0)
@@ -98,6 +112,17 @@ def main():
     approx(eng_keep.char("Diese Nusse").est_m3,
            (11 + 12) * 10.0 + 10 * (0.1 - 10.0))
 
+    # --- residue (spec F1/F2) ---
+    residues = [e for e in events if isinstance(e, ResidueEvent)]
+    assert len(residues) == 1, f"expected 1 paired residue, got {len(residues)}"
+    assert residues[0].qty == 13
+    assert residues[0].ore == "Brimful Coesite", residues[0].ore
+    assert residues[0].character == "Yuri Urt"
+
+    # REGRESSION (spec F1): residue must never enter the ore hold.
+    yuri = eng.char("Yuri Urt")
+    approx(yuri.est_m3, (13 + 14) * 10.0)
+
     neik = eng.char("Neik Kondur")
     # hold-full event snaps to capacity
     approx(neik.est_m3, 180000.0)
@@ -120,6 +145,115 @@ def main():
     # --- state persists --------------------------------------------------------
     eng2 = Engine(log_dir=tmp, state_path=tmp / "state.json")
     approx(eng2.char("Nancy Kondur").est_m3, 50000.0)
+
+    # --- scanned rock countdown (spec D1/D4) ---
+    eng.set_target("Yuri Urt", ore="Brimful Coesite", units=1000,
+                   distance_m=726.0)
+    tr = eng.char("Yuri Urt").target
+    assert tr is not None and tr.scan_units == 1000
+
+    # depletion counts mined AND residue (spec F1)
+    eng._apply_depletion(MiningEvent(character="Yuri Urt", qty=100,
+                                     ore="Brimful Coesite", m3=1000.0,
+                                     ts="2126.07.15 16:00:00"))
+    eng._apply_depletion(ResidueEvent(character="Yuri Urt", qty=25,
+                                      ore="Brimful Coesite",
+                                      ts="2126.07.15 16:00:00"))
+    assert eng.char("Yuri Urt").rock_remaining() == 875, \
+        eng.char("Yuri Urt").rock_remaining()
+
+    # a different ore does not deplete this rock
+    eng._apply_depletion(MiningEvent(character="Yuri Urt", qty=500,
+                                     ore="Bitumens", m3=5000.0,
+                                     ts="2126.07.15 16:00:30"))
+    assert eng.char("Yuri Urt").rock_remaining() == 875
+
+    # warm-up: too few ticks to trust a rate (spec: "showing nothing beats
+    # showing a confident wrong number"), and the UI must be able to say so
+    assert eng.char("Yuri Urt").rock_eta_s() is None
+    assert eng.char("Yuri Urt").rock_status() == "warmup", \
+        eng.char("Yuri Urt").rock_status()
+
+    # ticks before the scan anchor are ignored
+    eng._apply_depletion(MiningEvent(character="Yuri Urt", qty=999,
+                                     ore="Brimful Coesite", m3=9990.0,
+                                     ts="2000.01.01 00:00:00"))
+    assert eng.char("Yuri Urt").rock_remaining() == 875
+
+    # DroneStopEvent zeroes an observed pop regardless of arithmetic (D4)
+    eng.rock_popped("Yuri Urt")
+    assert eng.char("Yuri Urt").target is None
+
+    # over-depletion clears rather than going negative
+    eng.set_target("Yuri Urt", ore="Coesite", units=10, distance_m=5.0)
+    eng._apply_depletion(MiningEvent(character="Yuri Urt", qty=50,
+                                     ore="Coesite", m3=500.0,
+                                     ts="2126.07.15 17:00:00"))
+    assert eng.char("Yuri Urt").target is None
+
+    # a warmed-up rate produces a real ETA
+    eng.set_target("Yuri Urt", ore="Coesite", units=1000, distance_m=5.0)
+    for i in range(5):
+        eng._apply_depletion(MiningEvent(
+            character="Yuri Urt", qty=20, ore="Coesite", m3=200.0,
+            ts=f"2126.07.15 18:{i:02d}:00"))
+    yc = eng.char("Yuri Urt")
+    assert yc.rock_remaining() == 900
+    # 100 units over 4 minutes = 25 units/min -> 900 units = 36 min
+    eta = yc.rock_eta_s(now_epoch=ts_to_epoch("2126.07.15 18:04:00"))
+    assert eta is not None, "warmed-up rate should yield an ETA"
+    approx(eta, 900 / 25.0 * 60.0, tol=1.0)
+    assert yc.rock_status(
+        now_epoch=ts_to_epoch("2126.07.15 18:04:00")) == "ready"
+    # long after the last tick the countdown pauses rather than lying
+    assert yc.rock_status(
+        now_epoch=ts_to_epoch("2126.07.15 23:00:00")) == "idle"
+
+    # --- a system change abandons the tracked rock ---
+    # Scanner distances are ship-relative and rocks are grid-local, so a rock
+    # tracked in one system must not keep depleting from ticks mined in
+    # another. A gate jump always changes system, so it always invalidates.
+    sysdir = Path(tempfile.mkdtemp())
+    (sysdir / "20260715_190000_94444444.txt").write_bytes(
+        b"\xef\xbb\xbf" + (HEADER.format(name="Yuri Urt") + "\n".join([
+            "[ 2026.07.15 19:00:00 ] (mining) You mined 100 units of Coesite",
+            "[ 2026.07.15 19:05:00 ] (None) Jumping from AK-LNZ to NV-ZHM",
+            "[ 2026.07.15 19:10:00 ] (mining) You mined 100 units of Coesite",
+        ]) + "\n").encode("utf-8"))
+    esys = Engine(log_dir=sysdir, state_path=sysdir / "s.json")
+    esys.poll()
+    esys.set_target("Yuri Urt", ore="Coesite", units=5000, distance_m=726.0)
+    # ticks before the jump deplete the rock
+    esys._apply_depletion(MiningEvent(character="Yuri Urt", qty=100,
+                                      ore="Coesite", m3=1000.0,
+                                      ts="2126.07.15 19:00:00"))
+    assert esys.char("Yuri Urt").rock_remaining() == 4900
+    # the jump drops the target; later ticks must not touch it
+    esys.left_system("Yuri Urt")
+    assert esys.char("Yuri Urt").target is None, \
+        "a system change must abandon the tracked rock"
+
+    # --- target persistence ---
+    sp = tmp / "state_target.json"
+    e1 = Engine(log_dir=tmp, state_path=sp, default_capacity=180000.0)
+    e1.poll()
+    e1.set_target("Yuri Urt", ore="Coesite", units=5000, distance_m=726.0)
+    e1.char("Yuri Urt").target.depleted_units = 1200
+    e1.save_state()
+
+    e2 = Engine(log_dir=tmp, state_path=sp, default_capacity=180000.0)
+    t2 = e2.char("Yuri Urt").target
+    assert t2 is not None, "target did not survive reload"
+    assert t2.ore == "Coesite" and t2.scan_units == 5000
+    assert t2.depleted_units == 1200
+    approx(t2.distance_m, 726.0)
+
+    # a state file with no target key loads cleanly (backward compatible)
+    legacy = tmp / "state_legacy.json"
+    legacy.write_text('{"characters": {"Solo Pilot": {"capacity": 180000.0}}}',
+                      encoding="utf-8")
+    e3 = Engine(log_dir=tmp, state_path=legacy, default_capacity=180000.0)
+    assert e3.char("Solo Pilot").target is None
 
     # --- ore table edge cases ---------------------------------------------------
     t = OreTable()

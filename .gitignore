@@ -26,3 +26,4 @@ update/
 update-log.txt
 *.exe.new
 *.update.bat
+.superpowers/

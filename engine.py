@@ -63,6 +63,29 @@ DEFAULT_MINING_PATTERNS = [
 
 MINING_CHANNELS = {"mining", "notify", "info"}
 
+# "(mining) Additional 13 units depleted from asteroid as residue"
+# Verified in real gamelogs. These units leave the ASTEROID but never enter
+# the ore hold, so they must not touch est_m3 - but they do count against a
+# scanned rock. The line carries no ore name; it is paired to the character's
+# most recent mining tick (see RESIDUE_PAIR_S).
+RESIDUE_RE = re.compile(
+    rf"Additional\s+(?P<qty>{_NUM})\s+units?\s+depleted\s+from\s+asteroid",
+    re.IGNORECASE,
+)
+
+# Max gap between a mining tick and the residue line belonging to it. In real
+# logs the pair lands within the same timestamp second.
+RESIDUE_PAIR_S = 2.0
+
+# "[ ts ] (None) Jumping from AK-LNZ to NV-ZHM" - verified in real gamelogs.
+# Note the channel is "None", not a mining channel, so this is matched before
+# the MINING_CHANNELS filter. A gate jump always changes system, and asteroids
+# are grid-local, so it always invalidates a tracked rock.
+SYSTEM_CHANGE_RE = re.compile(
+    r"Jumping from\s+(?P<from_sys>.+?)\s+to\s+(?P<to_sys>.+?)\s*$",
+    re.IGNORECASE,
+)
+
 # "(notify) Successfully compressed Glistening Zeolites into 794 Compressed
 #  Glistening Zeolites."  Compression is 1:1 by units (verified against real
 # logs), so N compressed units consumed N raw units; the hold shrinks by
@@ -89,6 +112,11 @@ def ts_to_epoch(ts: str) -> float:
 
 RATE_WINDOW_S = 600   # mining rate = volume over the last 10 minutes
 RATE_IDLE_S = 300     # no cycle for 5 min -> treat as not mining (no ETA)
+
+# A rock rate needs a few real cycles before it means anything - the residue
+# share varies by crystal and ship, so it is measured, never assumed.
+ROCK_WARMUP_TICKS = 3
+ROCK_WARMUP_S = 90.0
 
 
 HOLD_FULL_MARKERS = (
@@ -173,6 +201,36 @@ class CompressionEvent:
     ore: str          # raw ore name
     delta_m3: float   # negative: how much the hold shrank
     ts: str
+
+
+@dataclass
+class ResidueEvent:
+    character: str
+    qty: int          # units removed from the asteroid, NOT added to the hold
+    ore: str          # inferred from the preceding mining tick
+    ts: str
+
+
+@dataclass
+class SystemChangeEvent:
+    character: str
+    to_system: str
+    ts: str
+
+
+@dataclass
+class TargetRock:
+    """The asteroid a pilot is currently mining, from a survey-scan paste.
+
+    Anchored exactly like CharacterState.anchor_ts/anchor_m3: scan_ts is the
+    moment the snapshot was taken, and only ticks newer than it count against
+    it, so replaying the logs on restart cannot double-count.
+    """
+    ore: str
+    scan_units: int
+    scan_ts: str             # log format "YYYY.MM.DD HH:MM:SS", UTC
+    distance_m: float
+    depleted_units: int = 0  # mined + residue since scan_ts
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +365,61 @@ class CharacterState:
     # logs can't fire it; a recent live mining tick arms it (False), going
     # idle fires once and disarms again until mining resumes
     idle_notified: bool = True
+    # scanned-rock countdown (see TargetRock); persisted via save_state
+    target: "TargetRock | None" = None
+    # rolling (epoch, units) removed from the rock - mined AND residue
+    rock_events: deque = field(default_factory=deque)
+
+    def rock_remaining(self) -> int | None:
+        """Units left in the scanned rock, or None when no rock is targeted."""
+        if not self.target:
+            return None
+        return max(0, self.target.scan_units - self.target.depleted_units)
+
+    def rock_depletion_rate(self, now_epoch: float | None = None) -> float:
+        """Units per minute coming off the rock (mined + residue); 0 when idle
+        or still warming up."""
+        if not self.rock_events:
+            return 0.0
+        now_epoch = now_epoch if now_epoch is not None else time.time()
+        newest = self.rock_events[-1][0]
+        if now_epoch - newest > RATE_IDLE_S:
+            return 0.0
+        oldest = self.rock_events[0][0]
+        span = newest - oldest
+        # Below the warm-up threshold the rate is noise, not a number.
+        if len(self.rock_events) < ROCK_WARMUP_TICKS or span < ROCK_WARMUP_S:
+            return 0.0
+        total = sum(u for _, u in self.rock_events)
+        return total / (span / 60.0)
+
+    def rock_status(self, now_epoch: float | None = None) -> str:
+        """Why there is (or isn't) a rock ETA: 'ready', 'warmup', or 'idle'.
+
+        The UI needs to tell these apart. A bare "-" during warm-up reads as a
+        broken feature; saying so costs nothing and buys trust.
+        """
+        if not self.target:
+            return "idle"
+        if not self.rock_events:
+            return "warmup"
+        now_epoch = now_epoch if now_epoch is not None else time.time()
+        if now_epoch - self.rock_events[-1][0] > RATE_IDLE_S:
+            return "idle"
+        span = self.rock_events[-1][0] - self.rock_events[0][0]
+        if len(self.rock_events) < ROCK_WARMUP_TICKS or span < ROCK_WARMUP_S:
+            return "warmup"
+        return "ready"
+
+    def rock_eta_s(self, now_epoch: float | None = None) -> float | None:
+        """Seconds until the scanned rock is dry; None when unknown."""
+        remaining = self.rock_remaining()
+        if not remaining:
+            return None
+        rate = self.rock_depletion_rate(now_epoch)
+        if rate <= 0:
+            return None
+        return remaining / rate * 60.0
 
     def mining_rate_m3_min(self, now_epoch: float | None = None) -> float:
         """Current mining speed in m3/min over the rolling window;
@@ -384,6 +497,9 @@ class Engine:
         self.patterns = [re.compile(p, re.IGNORECASE) for p in pats]
         self.files: dict[str, LogFile] = {}
         self.chars: dict[str, CharacterState] = {}
+        # character -> (ts, ore) of the most recent mining tick, used to give
+        # the ore-less residue line an ore name
+        self._last_tick: dict[str, tuple[str, str]] = {}
         self._last_scan = 0.0
         self._warned_missing_dir = False
         self._unmatched_logged = 0
@@ -414,13 +530,30 @@ class Engine:
                 anchor_ts=str(d.get("anchor_ts", "")),
                 anchor_m3=anchor_m3,
             )
+            td = d.get("target")
+            if isinstance(td, dict) and td.get("ore"):
+                self.chars[name].target = TargetRock(
+                    ore=str(td["ore"]),
+                    scan_units=int(td.get("scan_units", 0)),
+                    scan_ts=str(td.get("scan_ts", "")),
+                    distance_m=float(td.get("distance_m", 0.0)),
+                    depleted_units=int(td.get("depleted_units", 0)),
+                )
 
     def save_state(self):
-        data = {"characters": {
-            c.name: {"capacity": c.capacity, "last_event": c.last_event,
-                     "notified": c.notified, "anchor_ts": c.anchor_ts,
-                     "anchor_m3": c.anchor_m3}
-            for c in self.chars.values()}}
+        chars = {}
+        for c in self.chars.values():
+            d = {"capacity": c.capacity, "last_event": c.last_event,
+                 "notified": c.notified, "anchor_ts": c.anchor_ts,
+                 "anchor_m3": c.anchor_m3}
+            if c.target:
+                d["target"] = {"ore": c.target.ore,
+                               "scan_units": c.target.scan_units,
+                               "scan_ts": c.target.scan_ts,
+                               "distance_m": c.target.distance_m,
+                               "depleted_units": c.target.depleted_units}
+            chars[c.name] = d
+        data = {"characters": chars}
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             self.state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -546,6 +679,65 @@ class Engine:
             c.notified = False
         self.save_state()
 
+    # -- scanned rock ---------------------------------------------------------
+    def set_target(self, character: str, ore: str, units: int,
+                   distance_m: float):
+        """Anchor a scanned rock to a character. Re-pasting re-anchors."""
+        c = self.char(character)
+        c.target = TargetRock(ore=ore, scan_units=int(units), scan_ts=now_ts(),
+                              distance_m=float(distance_m))
+        c.rock_events.clear()
+        log.info("target: %s -> %s %d units @ %.0f m",
+                 character, ore, units, distance_m)
+        self.save_state()
+
+    def clear_target(self, character: str):
+        c = self.chars.get(character)
+        if not c:
+            return
+        c.target = None
+        c.rock_events.clear()
+        self.save_state()
+
+    def rock_popped(self, character: str):
+        """An observed pop (drone stop) outranks arithmetic - spec D4."""
+        c = self.chars.get(character)
+        if c and c.target:
+            log.info("target: %s rock popped (observed)", character)
+            self.clear_target(character)
+
+    def left_system(self, character: str):
+        """Abandon the tracked rock: asteroids are grid-local, and scanner
+        distances are measured from the ship, so a rock scanned in the system
+        you just left can never be the one you are mining now."""
+        c = self.chars.get(character)
+        if c and c.target:
+            log.info("target: %s left the system, dropping %s rock",
+                     character, c.target.ore)
+            self.clear_target(character)
+
+    def _apply_depletion(self, ev):
+        """Count a mining or residue event against the character's rock.
+
+        Gated on the rock's own scan_ts, independent of the hold anchor, so a
+        calibration newer than the scan cannot silently stop depletion.
+        """
+        c = self.chars.get(ev.character)
+        if not c or not c.target or ev.ore != c.target.ore:
+            return
+        if ev.ts <= c.target.scan_ts:   # log timestamps sort lexicographically
+            return
+        c.target.depleted_units += ev.qty
+        ep = ts_to_epoch(ev.ts)
+        if ep:
+            c.rock_events.append((ep, ev.qty))
+            while (c.rock_events and
+                   ep - c.rock_events[0][0] > RATE_WINDOW_S):
+                c.rock_events.popleft()
+        if c.rock_remaining() <= 0:
+            log.info("target: %s rock exhausted by count", ev.character)
+            self.clear_target(ev.character)
+
     def set_capacity(self, name: str, m3: float):
         c = self.char(name)
         c.capacity = max(1.0, float(m3))
@@ -607,6 +799,16 @@ class Engine:
                 ev = self._parse_line(name, ln)
                 if ev is None:
                     continue
+                # Rock depletion runs BEFORE the hold anchor filter below:
+                # the anchor is about cargo, and a calibration newer than the
+                # scan must not silently freeze the countdown. _apply_depletion
+                # gates on the rock's own scan_ts instead.
+                if isinstance(ev, (MiningEvent, ResidueEvent)):
+                    self._apply_depletion(ev)
+                elif isinstance(ev, DroneStopEvent):
+                    self.rock_popped(ev.character)
+                elif isinstance(ev, SystemChangeEvent):
+                    self.left_system(ev.character)
                 # anchor filter: log events at/before a character's last
                 # reset/calibration are already baked into anchor_m3 -
                 # skipping them makes startup replay idempotent.
@@ -616,7 +818,8 @@ class Engine:
                 # cargo - they never create rows or pass the anchor filter
                 ev_ts = getattr(ev, "ts", None)
                 if (ev_ts is not None and
-                        not isinstance(ev, (CombatEvent, DroneStopEvent))):
+                        not isinstance(ev, (CombatEvent, DroneStopEvent,
+                                            SystemChangeEvent))):
                     c = self.char(ev.character)
                     if c.anchor_ts and ev_ts <= c.anchor_ts:
                         continue
@@ -656,6 +859,10 @@ class Engine:
                 elif isinstance(ev, UnknownOreEvent):
                     c = self.char(ev.character)
                     c.unknown_ores[ev.ore] = c.unknown_ores.get(ev.ore, 0) + ev.qty
+                elif isinstance(ev, ResidueEvent):
+                    self.stats["residue_events"] = (
+                        self.stats.get("residue_events", 0) + 1)
+                    # NOTE: no est_m3 change - residue never enters the hold.
         if dirty:
             self.save_state()
         if ledger_dirty:
@@ -669,6 +876,13 @@ class Engine:
         channel = m.group("channel").strip().lower()
         if channel == "combat":
             return self._parse_combat(character, m) if self.combat_enabled else None
+        # Jump lines arrive on the "(None)" channel, so this must come before
+        # the MINING_CHANNELS filter below.
+        jm = SYSTEM_CHANGE_RE.search(TAG_RE.sub("", m.group("msg")).strip())
+        if jm:
+            return SystemChangeEvent(character=character,
+                                     to_system=jm.group("to_sys").strip(),
+                                     ts=m.group("ts"))
         if channel not in MINING_CHANNELS:
             return None
         msg = TAG_RE.sub("", m.group("msg")).strip()
@@ -694,6 +908,21 @@ class Engine:
                 delta = qty * (comp_vol - raw_vol)
             return CompressionEvent(character=character, qty=qty, ore=ore,
                                     delta_m3=delta, ts=m.group("ts"))
+        # Must come BEFORE the EXCLUDE_MARKERS check: "residue" is in that
+        # list (correctly - these units never enter the hold), but they do
+        # deplete the asteroid, so a scanned rock has to see them.
+        rm = RESIDUE_RE.search(msg)
+        if rm:
+            qty = parse_qty(rm.group("qty"))
+            last = self._last_tick.get(character)
+            if qty <= 0 or not last:
+                return None
+            last_ts, last_ore = last
+            gap = ts_to_epoch(m.group("ts")) - ts_to_epoch(last_ts)
+            if not (0 <= gap <= RESIDUE_PAIR_S):
+                return None
+            return ResidueEvent(character=character, qty=qty, ore=last_ore,
+                                ts=m.group("ts"))
         if any(k in low for k in EXCLUDE_MARKERS):
             return None
         for pat in self.patterns:
@@ -708,6 +937,7 @@ class Engine:
             if vol is None:
                 log.warning("unknown ore '%s' (qty %d) from %s", ore, qty, character)
                 return UnknownOreEvent(character=character, ore=ore, qty=qty)
+            self._last_tick[character] = (m.group("ts"), ore)
             return MiningEvent(character=character, qty=qty, ore=ore,
                                m3=qty * vol, ts=m.group("ts"))
         if channel == "mining":

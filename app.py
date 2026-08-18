@@ -35,16 +35,17 @@ log = logging.getLogger("orewatcher.app")
 from PySide6.QtCore import Qt, QTimer, QSize, QRect
 from PySide6.QtGui import (QAction, QBrush, QColor, QIcon, QPainter, QPen,
                            QPixmap, QFont)
-from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox,
-                               QDoubleSpinBox, QFileDialog, QFormLayout,
-                               QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-                               QMainWindow, QMenu, QMessageBox, QProgressBar,
-                               QPushButton, QScrollArea, QSpinBox,
-                               QSystemTrayIcon, QVBoxLayout, QWidget,
-                               QCheckBox)
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog,
+                               QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+                               QFormLayout, QHBoxLayout, QInputDialog, QLabel,
+                               QLineEdit, QMainWindow, QMenu, QMessageBox,
+                               QPlainTextEdit, QProgressBar, QPushButton,
+                               QScrollArea, QSpinBox, QSystemTrayIcon,
+                               QVBoxLayout, QWidget, QCheckBox)
 
 from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
                     CombatEvent, DroneStopEvent, ts_to_epoch)
+from scan import parse_scan
 
 APP_NAME = "Ore Hold Watcher"
 ORG_DIR = "OreHoldWatcher"
@@ -311,7 +312,7 @@ QPushButton {
     background: #4e5058; border: none; border-radius: 4px;
     padding: 5px 12px; color: #fff;
 }
-QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {
+QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox, QPlainTextEdit {
     background: #ffffff; color: #000000;
     border: 1px solid #1e1f22; border-radius: 4px; padding: 3px 6px;
     selection-background-color: #5865f2; selection-color: #ffffff;
@@ -402,6 +403,7 @@ class ClientWatcher:
         self.online: set[str] = set()   # character names with a live window
         self.clients = 0                # EVE windows seen (incl. char select)
         self.ready = False              # at least one successful refresh
+        self.last_focused: str | None = None   # most recent foreground pilot
 
     def refresh(self):
         if sys.platform != "win32":
@@ -412,6 +414,7 @@ class ClientWatcher:
             user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
             found: set[str] = set()
             count = [0]
+            fg = user32.GetForegroundWindow()
 
             @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
             def enum_cb(hwnd, _):
@@ -439,7 +442,13 @@ class ClientWatcher:
                         if exe in self.process_names:
                             count[0] += 1
                             if " - " in title:
-                                found.add(title.split(" - ", 1)[1].strip())
+                                who = title.split(" - ", 1)[1].strip()
+                                found.add(who)
+                                # remember which client you were last looking
+                                # at, so a scan pasted after alt-tabbing still
+                                # attributes to the right pilot (spec D3)
+                                if hwnd == fg:
+                                    self.last_focused = who
                 finally:
                     kernel32.CloseHandle(h)
                 return True
@@ -1174,6 +1183,37 @@ class CharRow(QWidget):
         lay.setSpacing(4)
         lay.addLayout(top)
         lay.addWidget(self.bar)
+        # Second line, only present when a scanned rock is being tracked
+        # (spec D5) - the window grows only when the feature is in use.
+        self.rock = QLabel("")
+        self.rock.setObjectName("rockLine")
+        self.rock.setVisible(False)
+        lay.addWidget(self.rock)
+
+    ROCK_WARN_S = 60.0    # soft alert threshold (spec D6)
+    ROCK_CRIT_S = 20.0
+
+    def update_rock(self, target, remaining, eta_s, pilot_name):
+        """Second line: what rock, how much left, how long, how stale."""
+        if not target:
+            self.rock.setVisible(False)
+            return
+        age = time.time() - ts_to_epoch(target.scan_ts)
+        # No ETA yet -> say so. A bare dash reads as a broken feature.
+        eta_txt = fmt_eta(eta_s) if eta_s else "measuring…"
+        # Anchor age and pilot are always shown: a stale number must look
+        # stale (spec D4), and misattribution must be visible (spec D3).
+        self.rock.setText(
+            f"⛏ {target.ore} · {remaining:,} left · dry in {eta_txt}"
+            f" · as of {fmt_dur(age)} · {pilot_name}")
+        colour = "#949ba4"
+        if eta_s is not None:
+            if eta_s <= self.ROCK_CRIT_S:
+                colour = "#f23f43"
+            elif eta_s <= self.ROCK_WARN_S:
+                colour = "#f0b232"
+        self.rock.setStyleSheet(f"color: {colour}; font-size: 11px;")
+        self.rock.setVisible(True)
 
     ARM_STYLES = {
         "armed":   ("⛏ armed",   "#23a55a"),
@@ -1215,6 +1255,9 @@ class CharRow(QWidget):
         m.addAction("Reset (hold emptied)", lambda: self.main.reset_char(self.name))
         m.addAction("Set current m³…", lambda: self.main.calibrate_char(self.name))
         m.addAction("Set capacity…", lambda: self.main.capacity_char(self.name))
+        m.addSeparator()
+        m.addAction("Paste survey scan…",
+                    lambda: ScanPasteDialog(self.main, self.name).exec())
         m.addSeparator()
         m.addAction("Remove from list", lambda: self.main.remove_char(self.name))
         m.exec(self.mapToGlobal(pos))
@@ -1924,6 +1967,113 @@ class OreHoldInfoDialog(DarkDialog):
             self.chosen = float(it.text(1 if base else 2).replace(",", ""))
             self.accept()
 
+
+class ScanPasteDialog(DarkDialog):
+    """Paste survey-scanner output, pick the rock being mined, arm a countdown.
+
+    The rock is auto-proposed as the nearest one whose ore matches what the
+    pilot is mining (spec D2) and the pilot from the last-focused client
+    (spec D3). Both are dropdowns: the guess is visible, so being wrong is
+    cheap.
+    """
+
+    def __init__(self, main: "MainWindow", preselect_pilot: str | None = None):
+        super().__init__(main)
+        self.main = main
+        self.rows: list = []
+        self.setWindowTitle("Paste survey scan")
+        self.resize(560, 520)
+
+        self.paste = QPlainTextEdit()
+        self.paste.setPlaceholderText(
+            "Select all rows in the survey scanner window, copy, paste here.")
+        self.paste.textChanged.connect(self.reparse)
+
+        self.pilot = QComboBox()
+        self.pilot.addItem("- select pilot -", None)
+        for name in sorted(main.engine.chars):
+            self.pilot.addItem(name, name)
+        guess = preselect_pilot or main.guess_scan_pilot()
+        if guess:
+            i = self.pilot.findData(guess)
+            if i >= 0:
+                self.pilot.setCurrentIndex(i)
+        self.pilot.currentIndexChanged.connect(lambda *_: self.preselect_rock())
+
+        self.rock = QComboBox()
+        self.warn = QLabel("")
+        self.warn.setWordWrap(True)
+        self.warn.setStyleSheet("color: #f0b232;")
+
+        self.ok = QPushButton("Track this rock")
+        self.ok.clicked.connect(self.accept_target)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.ok)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Survey scanner results:"))
+        lay.addWidget(self.paste, 1)
+        lay.addWidget(self.warn)
+        lay.addWidget(QLabel("Pilot:"))
+        lay.addWidget(self.pilot)
+        lay.addWidget(QLabel("Rock being mined:"))
+        lay.addWidget(self.rock)
+        lay.addLayout(buttons)
+        self.reparse()
+
+    def reparse(self):
+        text = self.paste.toPlainText()
+        self.rows, warnings = parse_scan(text, self.main.engine.table)
+        self.rock.clear()
+        # nearest first: the locked rock is the close one (spec F5)
+        for r in sorted(self.rows, key=lambda r: r.distance_m):
+            dist = (f"{r.distance_m:,.0f} m" if r.distance_m < 1000
+                    else f"{r.distance_m / 1000:,.0f} km")
+            self.rock.addItem(f"{r.ore} · {r.units:,} units · {dist}", r)
+        self.preselect_rock()
+        if warnings:
+            shown = warnings[:3]
+            more = (f" (+{len(warnings) - 3} more)" if len(warnings) > 3 else "")
+            self.warn.setText(" ".join(shown) + more)
+        else:
+            self.warn.setText("")
+        self.ok.setEnabled(bool(self.rows))
+
+    def preselect_rock(self):
+        """Nearest rock whose ore matches what this pilot is mining."""
+        who = self.pilot.currentData()
+        ore = None
+        if who:
+            tick = self.main.engine._last_tick.get(who)
+            ore = tick[1] if tick else None
+        if not ore or not self.rows:
+            return
+        for i in range(self.rock.count()):
+            row = self.rock.itemData(i)
+            if row is not None and row.ore == ore:
+                self.rock.setCurrentIndex(i)   # list is nearest-first
+                return
+
+    def accept_target(self):
+        who = self.pilot.currentData()
+        row = self.rock.currentData()
+        if not who:
+            self.warn.setText("Pick which pilot this scan came from.")
+            return
+        if row is None:
+            self.warn.setText("Pick the rock being mined.")
+            return
+        self.main.engine.set_target(who, ore=row.ore, units=row.units,
+                                    distance_m=row.distance_m)
+        self.main.refresh()
+        self.accept()
+
+
 class SettingsDialog(DarkDialog):
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
@@ -2246,6 +2396,8 @@ class MainWindow(QMainWindow):
         self.engine.drone_enabled = bool(self.settings["drone_alert_enabled"])
         self.prices = PriceService()
         self.clients = ClientWatcher(self.settings["eve_process_names"])
+        # character -> scan_ts already warned about; re-arms on re-anchor
+        self._rock_warned: dict[str, str] = {}
         self._last_client_scan = 0.0
         self._last_price_check = 0.0
         self._last_activity_ts = 0.0    # wall-clock of last time-in-state accrual
@@ -2324,6 +2476,8 @@ class MainWindow(QMainWindow):
         menu = QMenu()
         menu.addAction("Show / Hide", self.toggle_visible)
         menu.addAction("Recalculate from logs", self.recalculate)
+        menu.addAction("Paste survey scan…",
+                       lambda: ScanPasteDialog(self).exec())
         menu.addAction("Reset all holds to 0", self.reset_all)
         menu.addAction("Check for updates", self.manual_update_check)
         menu.addSeparator()
@@ -2561,6 +2715,42 @@ class MainWindow(QMainWindow):
     def reset_char(self, name: str):
         self.engine.reset(name)
         self.refresh()
+
+    def _rock_alert(self, c):
+        """Soft, local-only warning that a rock is about to run dry (D6).
+
+        Strip miners get no popped-rock line in the log at all (spec F3), so
+        without this a minimised window means no warning. Deliberately NOT
+        routed through Notifier.alert(), which fans out to popup, sound,
+        webhook and ntfy - this alert never leaves the machine.
+        """
+        if not c.target:
+            self._rock_warned.pop(c.name, None)
+            return
+        eta = c.rock_eta_s()
+        if eta is None or eta > CharRow.ROCK_WARN_S:
+            return
+        if self._rock_warned.get(c.name) == c.target.scan_ts:
+            return
+        self._rock_warned[c.name] = c.target.scan_ts
+        if self.settings["notify_overlay"]:
+            self.notifier.overlay.show_alert(
+                f"{self.disp(c.name)}: {c.target.ore} rock nearly dry")
+
+    def guess_scan_pilot(self) -> str | None:
+        """Best guess at which pilot a pasted scan belongs to (spec D3).
+
+        Last-focused EVE client first; if that is unknown or stale, fall back
+        to the only pilot currently mining. Ambiguity returns None and the
+        dialog leaves its dropdown unselected rather than guessing wrong -
+        misattribution corrupts two pilots' countdowns at once.
+        """
+        who = getattr(self.clients, "last_focused", None)
+        if who and who in self.engine.chars:
+            return who
+        active = [c.name for c in self.engine.chars.values()
+                  if c.mining_rate_m3_min() > 0]
+        return active[0] if len(active) == 1 else None
 
     def calibrate_char(self, name: str):
         c = self.engine.char(name)
@@ -2994,6 +3184,9 @@ class MainWindow(QMainWindow):
                 arm = "standby"
             row.lbl.setText(self.disp(c.name))
             row.update_state(c.est_m3, c.capacity, c.eta_full_s(), arm)
+            row.update_rock(c.target, c.rock_remaining(), c.rock_eta_s(),
+                            self.disp(c.name))
+            self._rock_alert(c)
         if reorder:
             self._applied_order = wanted
 

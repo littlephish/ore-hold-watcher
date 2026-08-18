@@ -18,6 +18,15 @@ top of that:
   rate-limited, listing every pilot.
 - Compression tracked automatically; time-to-full ETA per pilot from each
   pilot's own mining rate.
+- Survey-scan rock countdown: paste the scanner results and each pilot gets a
+  live "dry in 4m12s" for the rock they're on. It counts mined *and* residue
+  units, so it tracks the rock draining ~25% faster than your hold fills.
+  Soft on-screen warning only - never sent to Discord or your phone.
+  Scanner distances are measured from the scanning ship, so paste **each
+  miner's own scan** (right-click that pilot's row - it preselects them) and
+  the nearest rock of the ore they're mining is picked automatically. Two
+  pilots in the same belt get different distance columns, which is exactly
+  what tells their rocks apart.
 - Extra alerts (all opt-in): a pilot idle for X minutes, a pilot attacked
   by a player (never NPC rats), a mining drone stopping on a dry rock.
 - Closed-client detection so a logged-off alt never reads as "idle".
