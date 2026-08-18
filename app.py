@@ -312,7 +312,7 @@ QPushButton {
     background: #4e5058; border: none; border-radius: 4px;
     padding: 5px 12px; color: #fff;
 }
-QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {
+QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox, QPlainTextEdit {
     background: #ffffff; color: #000000;
     border: 1px solid #1e1f22; border-radius: 4px; padding: 3px 6px;
     selection-background-color: #5865f2; selection-color: #ffffff;

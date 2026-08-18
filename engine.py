@@ -77,6 +77,15 @@ RESIDUE_RE = re.compile(
 # logs the pair lands within the same timestamp second.
 RESIDUE_PAIR_S = 2.0
 
+# "[ ts ] (None) Jumping from AK-LNZ to NV-ZHM" - verified in real gamelogs.
+# Note the channel is "None", not a mining channel, so this is matched before
+# the MINING_CHANNELS filter. A gate jump always changes system, and asteroids
+# are grid-local, so it always invalidates a tracked rock.
+SYSTEM_CHANGE_RE = re.compile(
+    r"Jumping from\s+(?P<from_sys>.+?)\s+to\s+(?P<to_sys>.+?)\s*$",
+    re.IGNORECASE,
+)
+
 # "(notify) Successfully compressed Glistening Zeolites into 794 Compressed
 #  Glistening Zeolites."  Compression is 1:1 by units (verified against real
 # logs), so N compressed units consumed N raw units; the hold shrinks by
@@ -199,6 +208,13 @@ class ResidueEvent:
     character: str
     qty: int          # units removed from the asteroid, NOT added to the hold
     ore: str          # inferred from the preceding mining tick
+    ts: str
+
+
+@dataclass
+class SystemChangeEvent:
+    character: str
+    to_system: str
     ts: str
 
 
@@ -672,6 +688,16 @@ class Engine:
             log.info("target: %s rock popped (observed)", character)
             self.clear_target(character)
 
+    def left_system(self, character: str):
+        """Abandon the tracked rock: asteroids are grid-local, and scanner
+        distances are measured from the ship, so a rock scanned in the system
+        you just left can never be the one you are mining now."""
+        c = self.chars.get(character)
+        if c and c.target:
+            log.info("target: %s left the system, dropping %s rock",
+                     character, c.target.ore)
+            self.clear_target(character)
+
     def _apply_depletion(self, ev):
         """Count a mining or residue event against the character's rock.
 
@@ -763,6 +789,8 @@ class Engine:
                     self._apply_depletion(ev)
                 elif isinstance(ev, DroneStopEvent):
                     self.rock_popped(ev.character)
+                elif isinstance(ev, SystemChangeEvent):
+                    self.left_system(ev.character)
                 # anchor filter: log events at/before a character's last
                 # reset/calibration are already baked into anchor_m3 -
                 # skipping them makes startup replay idempotent.
@@ -772,7 +800,8 @@ class Engine:
                 # cargo - they never create rows or pass the anchor filter
                 ev_ts = getattr(ev, "ts", None)
                 if (ev_ts is not None and
-                        not isinstance(ev, (CombatEvent, DroneStopEvent))):
+                        not isinstance(ev, (CombatEvent, DroneStopEvent,
+                                            SystemChangeEvent))):
                     c = self.char(ev.character)
                     if c.anchor_ts and ev_ts <= c.anchor_ts:
                         continue
@@ -829,6 +858,13 @@ class Engine:
         channel = m.group("channel").strip().lower()
         if channel == "combat":
             return self._parse_combat(character, m) if self.combat_enabled else None
+        # Jump lines arrive on the "(None)" channel, so this must come before
+        # the MINING_CHANNELS filter below.
+        jm = SYSTEM_CHANGE_RE.search(TAG_RE.sub("", m.group("msg")).strip())
+        if jm:
+            return SystemChangeEvent(character=character,
+                                     to_system=jm.group("to_sys").strip(),
+                                     ts=m.group("ts"))
         if channel not in MINING_CHANNELS:
             return None
         msg = TAG_RE.sub("", m.group("msg")).strip()

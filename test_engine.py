@@ -202,6 +202,30 @@ def main():
     assert eta is not None, "warmed-up rate should yield an ETA"
     approx(eta, 900 / 25.0 * 60.0, tol=1.0)
 
+    # --- a system change abandons the tracked rock ---
+    # Scanner distances are ship-relative and rocks are grid-local, so a rock
+    # tracked in one system must not keep depleting from ticks mined in
+    # another. A gate jump always changes system, so it always invalidates.
+    sysdir = Path(tempfile.mkdtemp())
+    (sysdir / "20260715_190000_94444444.txt").write_bytes(
+        b"\xef\xbb\xbf" + (HEADER.format(name="Yuri Urt") + "\n".join([
+            "[ 2026.07.15 19:00:00 ] (mining) You mined 100 units of Coesite",
+            "[ 2026.07.15 19:05:00 ] (None) Jumping from AK-LNZ to NV-ZHM",
+            "[ 2026.07.15 19:10:00 ] (mining) You mined 100 units of Coesite",
+        ]) + "\n").encode("utf-8"))
+    esys = Engine(log_dir=sysdir, state_path=sysdir / "s.json")
+    esys.poll()
+    esys.set_target("Yuri Urt", ore="Coesite", units=5000, distance_m=726.0)
+    # ticks before the jump deplete the rock
+    esys._apply_depletion(MiningEvent(character="Yuri Urt", qty=100,
+                                      ore="Coesite", m3=1000.0,
+                                      ts="2126.07.15 19:00:00"))
+    assert esys.char("Yuri Urt").rock_remaining() == 4900
+    # the jump drops the target; later ticks must not touch it
+    esys.left_system("Yuri Urt")
+    assert esys.char("Yuri Urt").target is None, \
+        "a system change must abandon the tracked rock"
+
     # --- target persistence ---
     sp = tmp / "state_target.json"
     e1 = Engine(log_dir=tmp, state_path=sp, default_capacity=180000.0)
