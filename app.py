@@ -402,6 +402,7 @@ class ClientWatcher:
         self.online: set[str] = set()   # character names with a live window
         self.clients = 0                # EVE windows seen (incl. char select)
         self.ready = False              # at least one successful refresh
+        self.last_focused: str | None = None   # most recent foreground pilot
 
     def refresh(self):
         if sys.platform != "win32":
@@ -412,6 +413,7 @@ class ClientWatcher:
             user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
             found: set[str] = set()
             count = [0]
+            fg = user32.GetForegroundWindow()
 
             @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
             def enum_cb(hwnd, _):
@@ -439,7 +441,13 @@ class ClientWatcher:
                         if exe in self.process_names:
                             count[0] += 1
                             if " - " in title:
-                                found.add(title.split(" - ", 1)[1].strip())
+                                who = title.split(" - ", 1)[1].strip()
+                                found.add(who)
+                                # remember which client you were last looking
+                                # at, so a scan pasted after alt-tabbing still
+                                # attributes to the right pilot (spec D3)
+                                if hwnd == fg:
+                                    self.last_focused = who
                 finally:
                     kernel32.CloseHandle(h)
                 return True
@@ -2561,6 +2569,21 @@ class MainWindow(QMainWindow):
     def reset_char(self, name: str):
         self.engine.reset(name)
         self.refresh()
+
+    def guess_scan_pilot(self) -> str | None:
+        """Best guess at which pilot a pasted scan belongs to (spec D3).
+
+        Last-focused EVE client first; if that is unknown or stale, fall back
+        to the only pilot currently mining. Ambiguity returns None and the
+        dialog leaves its dropdown unselected rather than guessing wrong -
+        misattribution corrupts two pilots' countdowns at once.
+        """
+        who = getattr(self.clients, "last_focused", None)
+        if who and who in self.engine.chars:
+            return who
+        active = [c.name for c in self.engine.chars.values()
+                  if c.mining_rate_m3_min() > 0]
+        return active[0] if len(active) == 1 else None
 
     def calibrate_char(self, name: str):
         c = self.engine.char(name)
