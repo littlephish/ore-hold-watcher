@@ -42,6 +42,14 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt nuitka
 
+      - name: Generate SDE volume catalog
+        shell: pwsh
+        run: |
+          python -c "from sde import update_catalog; update_catalog('sde_volumes.json')"
+          if (-not (Test-Path "sde_volumes.json")) {
+            throw "SDE volume catalog was not generated"
+          }
+
       - name: Cache Nuitka compilation cache
         uses: actions/cache@v4
         with:
@@ -77,6 +85,7 @@ jobs:
             --file-description="Ore Hold Watcher" `
             --copyright="Ore Hold Watcher" `
             --output-dir=build `
+            --include-data-files=sde_volumes.json=sde_volumes.json `
             --output-filename=OreHoldWatcher.exe `
             app.py
 
@@ -104,6 +113,9 @@ jobs:
           }
           if (-not (Test-Path "dist\OreHoldWatcher\update.exe")) {
             throw "staged folder missing update.exe"
+          }
+          if (-not (Test-Path "dist\OreHoldWatcher\sde_volumes.json")) {
+            throw "staged folder missing sde_volumes.json"
           }
 
       # The updater looks for a *-win*.zip asset, so keep "win" in the name.

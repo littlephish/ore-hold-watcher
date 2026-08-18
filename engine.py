@@ -45,6 +45,7 @@ LINE_RE = re.compile(
 LISTENER_RE = re.compile(r"Listener:\s*(?P<name>.+?)\s*$")
 
 TAG_RE = re.compile(r"<[^>]+>")  # strip <color=...>, <b>, etc.
+GRADE_SUFFIX_RE = re.compile(r"\s+[ivx]+-grade$", re.IGNORECASE)
 
 # Number like 1,244 or 1 244 or 1'244 or 1244
 _NUM = r"[\d][\d,.  '\s]*"
@@ -238,16 +239,30 @@ class TargetRock:
 # ---------------------------------------------------------------------------
 
 class OreTable:
-    def __init__(self, override_path: Path | None = None):
+    def __init__(self, override_path: Path | None = None,
+                 sde_paths: list[Path] | None = None):
         self.base = {k.lower(): v for k, v in ores.ORE_VOLUMES.items()}
         self.compressed = {k.lower(): v for k, v in ores.COMPRESSED_VOLUMES.items()}
         self.overrides: dict[str, float] = {}
+        self.sde: dict[str, float] = {}
         if override_path and override_path.exists():
             try:
                 data = json.loads(override_path.read_text(encoding="utf-8"))
                 self.overrides = {str(k).lower(): float(v) for k, v in data.items()}
             except Exception:
                 pass  # a broken override file should never kill the app
+        self.load_sde(sde_paths or [])
+
+    def load_sde(self, paths: list[Path] | None) -> None:
+        """Load SDE catalogs in priority order, ignoring broken files."""
+        self.sde = {}
+        for path in paths or []:
+            try:
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+                for name, volume in data.items():
+                    self.sde.setdefault(str(name).lower(), float(volume))
+            except (OSError, TypeError, ValueError):
+                continue
 
     def unit_volume(self, name: str) -> float | None:
         n = " ".join(name.split()).strip().strip(".*").lower()
@@ -255,8 +270,19 @@ class OreTable:
             return None
         if n in self.overrides:
             return self.overrides[n]
+        if n in self.sde:
+            return self.sde[n]
         if n in self.base:
             return self.base[n]
+        graded = GRADE_SUFFIX_RE.sub("", n)
+        if graded != n:
+            n = graded
+            if n in self.overrides:
+                return self.overrides[n]
+            if n in self.sde:
+                return self.sde[n]
+            if n in self.base:
+                return self.base[n]
         for prefix in ("batch compressed ", "compressed "):
             if n.startswith(prefix):
                 rest = n[len(prefix):]
@@ -267,7 +293,8 @@ class OreTable:
                 if base is not None:
                     return base / 100.0
                 return None
-        return self._suffix_lookup(n, self.base)
+        volume = self._suffix_lookup(n, self.sde)
+        return volume if volume is not None else self._suffix_lookup(n, self.base)
 
     @staticmethod
     def _suffix_lookup(n: str, table: dict[str, float]) -> float | None:
@@ -463,7 +490,8 @@ class Engine:
                  compressed_leaves_hold: bool = True,
                  combat_enabled: bool = True,
                  ledger_path: Path | None = None,
-                 ledger_enabled: bool = False):
+                 ledger_enabled: bool = False,
+                 sde_paths: list[Path] | None = None):
         self.log_dir = Path(log_dir)
         self.state_path = Path(state_path)
         self.lookback_hours = lookback_hours
@@ -492,7 +520,8 @@ class Engine:
         #         live ticks by the GUI; not derived from logs on replay.
         self.ledger = {"marks": {}, "days": {}, "prices": {}, "activity": {}}
         self._load_ledger()
-        self.table = OreTable(ore_override_path)
+        self._sde_paths = list(sde_paths or [])
+        self.table = OreTable(ore_override_path, self._sde_paths)
         pats = mining_patterns or DEFAULT_MINING_PATTERNS
         self.patterns = [re.compile(p, re.IGNORECASE) for p in pats]
         self.files: dict[str, LogFile] = {}
@@ -510,6 +539,11 @@ class Engine:
                  self.log_dir, self.log_dir.is_dir(), lookback_hours,
                  compressed_leaves_hold, len(self.patterns))
         self.load_state()
+
+    def reload_sde(self, paths: list[Path]) -> None:
+        """Reload SDE volumes after a catalog update."""
+        self._sde_paths = list(paths)
+        self.table.load_sde(self._sde_paths)
 
     # -- persistence --------------------------------------------------------
     def load_state(self):

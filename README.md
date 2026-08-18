@@ -83,6 +83,13 @@ volume table. Variants like Concentrated Veldspar resolve to their base
 ore, Compressed ores use compressed volumes, and ice, moon ore, and gas are
 included.
 
+Published ore, ice, gas, and resource variants are also loaded from a compact
+SDE-derived volume catalog. Builds refresh and bundle this catalog so the app
+works offline. To refresh it while running, open Settings and choose **Update
+ore data from SDE**; the existing catalog is kept if the download fails. User
+values in `ores_override.json` still take precedence over SDE and built-in
+values.
+
 The number shown is an estimate accumulated since your last reset, because
 EVE's logs never record unloads. When a hauler empties a hold, right-click
 the character row and pick **Reset**. You can also pick **Set current m³…**

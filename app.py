@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog,
 from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
                     CombatEvent, DroneStopEvent, ts_to_epoch)
 from scan import parse_scan
+from sde import update_catalog
 
 APP_NAME = "Ore Hold Watcher"
 ORG_DIR = "OreHoldWatcher"
@@ -94,7 +95,7 @@ _CONFIG_DIR: Path | None = None
 # every file kept in the config dir - used for one-time migration when the
 # config location moves between the portable (beside-exe) and AppData layouts
 _CONFIG_FILES = ("settings.json", "state.json", "ores_override.json",
-                 "ledger.json", "prices.json")
+                 "ledger.json", "prices.json", "sde_volumes.json")
 
 
 def _migrate_config(src: Path, dst: Path) -> None:
@@ -136,6 +137,13 @@ def config_dir() -> Path:
         d = appdata
     _CONFIG_DIR = d
     return d
+
+
+def sde_catalog_paths() -> list[Path]:
+    """Downloaded catalog wins over the catalog bundled with the build."""
+    paths = [config_dir() / "sde_volumes.json",
+             app_base_dir() / "sde_volumes.json"]
+    return [p for p in paths if p.exists()]
 
 
 _LOG_FMT = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
@@ -2211,6 +2219,9 @@ class SettingsDialog(DarkDialog):
         self.ledger_prices.setChecked(bool(settings["ledger_fetch_prices"]))
         self.ledger_backfill = QCheckBox("Value unpriced past days at today's "
                                          "price (marked as estimated)")
+        self.sde_update = QPushButton("Update ore data from SDE")
+        self.sde_update.setToolTip(
+            "Download the latest published ore, ice, gas, and variant volumes")
         self.ledger_backfill.setChecked(bool(settings["ledger_backfill_prices"]))
         self.upd_check = QCheckBox("Check GitHub for app updates (daily, from "
                                    + DEFAULT_UPDATE_REPO + ")")
@@ -2240,6 +2251,7 @@ class SettingsDialog(DarkDialog):
         gf.addRow(self.ledger_on)
         gf.addRow(self.ledger_prices)
         gf.addRow(self.ledger_backfill)
+        gf.addRow(self.sde_update)
         gf.addRow(self.upd_check)
         gf.addRow(self.dbg)
         gf.addRow(self.open_log)
@@ -2392,6 +2404,7 @@ class MainWindow(QMainWindow):
             combat_enabled=bool(self.settings["combat_alert_enabled"]),
             ledger_path=config_dir() / "ledger.json",
             ledger_enabled=bool(self.settings["ledger_enabled"]),
+            sde_paths=sde_catalog_paths(),
         )
         self.engine.drone_enabled = bool(self.settings["drone_alert_enabled"])
         self.prices = PriceService()
@@ -2809,6 +2822,50 @@ class MainWindow(QMainWindow):
         self.engine.set_capacity(name, val)
         self.refresh()
 
+    def update_sde_catalog(self, dialog: SettingsDialog):
+        """Refresh the user catalog without blocking the Settings dialog."""
+        if getattr(self, "_sde_busy", False):
+            return
+        self._sde_busy = True
+        self._sde_error = None
+        self._sde_count = 0
+        dialog.sde_update.setEnabled(False)
+        dialog.sde_update.setText("Updating SDE data...")
+
+        def worker():
+            try:
+                self._sde_count = update_catalog(
+                    config_dir() / "sde_volumes.json")
+            except Exception as exc:
+                self._sde_error = str(exc)
+            finally:
+                self._sde_busy = False
+
+        threading.Thread(target=worker, daemon=True).start()
+        timer = QTimer(dialog)
+        dialog._sde_timer = timer
+
+        def finish():
+            if self._sde_busy:
+                return
+            timer.stop()
+            dialog.sde_update.setEnabled(True)
+            dialog.sde_update.setText("Update ore data from SDE")
+            if self._sde_error:
+                QMessageBox.warning(dialog, "SDE update failed",
+                                    "The existing ore data was kept.\n\n" +
+                                    self._sde_error)
+                return
+            self.engine.reload_sde(sde_catalog_paths())
+            dialog.sde_update.setToolTip(
+                f"Updated {self._sde_count:,} published resource volumes")
+            self.status.setText(
+                f"SDE data updated: {self._sde_count:,} resource volumes")
+            self.refresh()
+
+        timer.timeout.connect(finish)
+        timer.start(250)
+
     def remove_char(self, name: str):
         self.engine.remove(name)
         self.refresh()
@@ -2821,6 +2878,7 @@ class MainWindow(QMainWindow):
             body, payload = self.fleet_summary()  # real current fleet state
             self.notifier.alert("⚠ Test alert - Ore Hold Watcher", body, payload)
         dlg.test_btn.clicked.connect(send_test)
+        dlg.sde_update.clicked.connect(lambda: self.update_sde_catalog(dlg))
 
         if dlg.exec() == QDialog.Accepted:
             dlg.apply()

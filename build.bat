@@ -22,6 +22,15 @@ if not exist .venv (
 )
 .venv\Scripts\python -m pip install -r requirements.txt nuitka
 
+rem Generate the compact resource-volume catalog from the latest SDE. The
+rem build remains self-contained and offline after this step completes.
+.venv\Scripts\python -c "from sde import update_catalog; update_catalog('sde_volumes.json')"
+if errorlevel 1 (
+    echo.
+    echo BUILD FAILED - could not update the SDE volume catalog.
+    exit /b 1
+)
+
 rem stop a running copy so the destination folder isn't locked
 taskkill /f /im OreHoldWatcher.exe >nul 2>&1
 
@@ -39,6 +48,7 @@ if exist build rmdir /s /q build
     --file-description="Ore Hold Watcher" ^
     --copyright="Ore Hold Watcher" ^
     --output-dir=build ^
+    --include-data-files=sde_volumes.json=sde_volumes.json ^
     --output-filename=OreHoldWatcher.exe ^
     app.py
 if errorlevel 1 (
@@ -55,6 +65,10 @@ if not exist "build\app.dist\OreHoldWatcher.exe" (
 if not exist dist mkdir dist
 if exist "dist\OreHoldWatcher" rmdir /s /q "dist\OreHoldWatcher"
 xcopy /e /i /y "build\app.dist" "dist\OreHoldWatcher" >nul
+if not exist "dist\OreHoldWatcher\sde_volumes.json" (
+    echo BUILD FAILED - staged program folder is missing sde_volumes.json.
+    exit /b 1
+)
 
 rem License notices - both GPLv3 (this app) and MIT (updater/) require the
 rem notice to travel with the binaries. Staged into the program folder so the
