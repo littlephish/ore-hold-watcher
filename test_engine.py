@@ -5,7 +5,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from engine import Engine, MiningEvent, HoldFullEvent, UnknownOreEvent, OreTable
+from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
+                    OreTable, ResidueEvent)
 
 HEADER = (
     "------------------------------------------------------------\n"
@@ -41,6 +42,16 @@ LINES_B = HEADER.format(name="Nancy Kondur") + "\n".join([
     "[ 2026.07.15 12:01:30 ] (mining) You have successfully mined 5,000 units of <color=0xff00ff00>Golden Omber</color>",
 ]) + "\n"
 
+# Residue: depletes the asteroid but never enters the hold (spec F1).
+# The residue line carries no ore name and must pair with the tick above it.
+LINES_D = HEADER.format(name="Yuri Urt") + "\n".join([
+    "[ 2026.07.15 15:00:00 ] (mining) You mined 13 units of Brimful Coesite",
+    "[ 2026.07.15 15:00:00 ] (mining) Additional 13 units depleted from asteroid as residue",
+    "[ 2026.07.15 15:01:00 ] (mining) You mined 14 units of Brimful Coesite",
+    # >2s after any tick: unpaired, must be discarded
+    "[ 2026.07.15 15:05:30 ] (mining) Additional 99 units depleted from asteroid as residue",
+]) + "\n"
+
 
 def approx(a, b, tol=0.01):
     assert abs(a - b) < tol, f"{a} != {b}"
@@ -57,6 +68,9 @@ def main():
     # real-world format: markup-laden drone mining + compression, CRLF
     (tmp / "20260715_130645_2123973494.txt").write_bytes(
         b"\xef\xbb\xbf" + LINES_C.replace("\n", "\r\n").encode("utf-8"))
+    # residue lines (spec F1/F2)
+    (tmp / "20260715_150000_93333333.txt").write_bytes(
+        b"\xef\xbb\xbf" + LINES_D.encode("utf-8"))
 
     eng = Engine(log_dir=tmp, state_path=tmp / "state.json",
                  default_capacity=180000.0)
@@ -97,6 +111,17 @@ def main():
     eng_keep.poll()
     approx(eng_keep.char("Diese Nusse").est_m3,
            (11 + 12) * 10.0 + 10 * (0.1 - 10.0))
+
+    # --- residue (spec F1/F2) ---
+    residues = [e for e in events if isinstance(e, ResidueEvent)]
+    assert len(residues) == 1, f"expected 1 paired residue, got {len(residues)}"
+    assert residues[0].qty == 13
+    assert residues[0].ore == "Brimful Coesite", residues[0].ore
+    assert residues[0].character == "Yuri Urt"
+
+    # REGRESSION (spec F1): residue must never enter the ore hold.
+    yuri = eng.char("Yuri Urt")
+    approx(yuri.est_m3, (13 + 14) * 10.0)
 
     neik = eng.char("Neik Kondur")
     # hold-full event snaps to capacity

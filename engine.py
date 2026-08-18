@@ -63,6 +63,20 @@ DEFAULT_MINING_PATTERNS = [
 
 MINING_CHANNELS = {"mining", "notify", "info"}
 
+# "(mining) Additional 13 units depleted from asteroid as residue"
+# Verified in real gamelogs. These units leave the ASTEROID but never enter
+# the ore hold, so they must not touch est_m3 - but they do count against a
+# scanned rock. The line carries no ore name; it is paired to the character's
+# most recent mining tick (see RESIDUE_PAIR_S).
+RESIDUE_RE = re.compile(
+    rf"Additional\s+(?P<qty>{_NUM})\s+units?\s+depleted\s+from\s+asteroid",
+    re.IGNORECASE,
+)
+
+# Max gap between a mining tick and the residue line belonging to it. In real
+# logs the pair lands within the same timestamp second.
+RESIDUE_PAIR_S = 2.0
+
 # "(notify) Successfully compressed Glistening Zeolites into 794 Compressed
 #  Glistening Zeolites."  Compression is 1:1 by units (verified against real
 # logs), so N compressed units consumed N raw units; the hold shrinks by
@@ -172,6 +186,14 @@ class CompressionEvent:
     qty: int          # compressed units produced == raw units consumed (1:1)
     ore: str          # raw ore name
     delta_m3: float   # negative: how much the hold shrank
+    ts: str
+
+
+@dataclass
+class ResidueEvent:
+    character: str
+    qty: int          # units removed from the asteroid, NOT added to the hold
+    ore: str          # inferred from the preceding mining tick
     ts: str
 
 
@@ -384,6 +406,9 @@ class Engine:
         self.patterns = [re.compile(p, re.IGNORECASE) for p in pats]
         self.files: dict[str, LogFile] = {}
         self.chars: dict[str, CharacterState] = {}
+        # character -> (ts, ore) of the most recent mining tick, used to give
+        # the ore-less residue line an ore name
+        self._last_tick: dict[str, tuple[str, str]] = {}
         self._last_scan = 0.0
         self._warned_missing_dir = False
         self._unmatched_logged = 0
@@ -656,6 +681,10 @@ class Engine:
                 elif isinstance(ev, UnknownOreEvent):
                     c = self.char(ev.character)
                     c.unknown_ores[ev.ore] = c.unknown_ores.get(ev.ore, 0) + ev.qty
+                elif isinstance(ev, ResidueEvent):
+                    self.stats["residue_events"] = (
+                        self.stats.get("residue_events", 0) + 1)
+                    # NOTE: no est_m3 change - residue never enters the hold.
         if dirty:
             self.save_state()
         if ledger_dirty:
@@ -694,6 +723,21 @@ class Engine:
                 delta = qty * (comp_vol - raw_vol)
             return CompressionEvent(character=character, qty=qty, ore=ore,
                                     delta_m3=delta, ts=m.group("ts"))
+        # Must come BEFORE the EXCLUDE_MARKERS check: "residue" is in that
+        # list (correctly - these units never enter the hold), but they do
+        # deplete the asteroid, so a scanned rock has to see them.
+        rm = RESIDUE_RE.search(msg)
+        if rm:
+            qty = parse_qty(rm.group("qty"))
+            last = self._last_tick.get(character)
+            if qty <= 0 or not last:
+                return None
+            last_ts, last_ore = last
+            gap = ts_to_epoch(m.group("ts")) - ts_to_epoch(last_ts)
+            if not (0 <= gap <= RESIDUE_PAIR_S):
+                return None
+            return ResidueEvent(character=character, qty=qty, ore=last_ore,
+                                ts=m.group("ts"))
         if any(k in low for k in EXCLUDE_MARKERS):
             return None
         for pat in self.patterns:
@@ -708,6 +752,7 @@ class Engine:
             if vol is None:
                 log.warning("unknown ore '%s' (qty %d) from %s", ore, qty, character)
                 return UnknownOreEvent(character=character, ore=ore, qty=qty)
+            self._last_tick[character] = (m.group("ts"), ore)
             return MiningEvent(character=character, qty=qty, ore=ore,
                                m3=qty * vol, ts=m.group("ts"))
         if channel == "mining":
