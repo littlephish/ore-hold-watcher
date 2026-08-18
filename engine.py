@@ -393,6 +393,24 @@ class CharacterState:
         total = sum(u for _, u in self.rock_events)
         return total / (span / 60.0)
 
+    def rock_status(self, now_epoch: float | None = None) -> str:
+        """Why there is (or isn't) a rock ETA: 'ready', 'warmup', or 'idle'.
+
+        The UI needs to tell these apart. A bare "-" during warm-up reads as a
+        broken feature; saying so costs nothing and buys trust.
+        """
+        if not self.target:
+            return "idle"
+        if not self.rock_events:
+            return "warmup"
+        now_epoch = now_epoch if now_epoch is not None else time.time()
+        if now_epoch - self.rock_events[-1][0] > RATE_IDLE_S:
+            return "idle"
+        span = self.rock_events[-1][0] - self.rock_events[0][0]
+        if len(self.rock_events) < ROCK_WARMUP_TICKS or span < ROCK_WARMUP_S:
+            return "warmup"
+        return "ready"
+
     def rock_eta_s(self, now_epoch: float | None = None) -> float | None:
         """Seconds until the scanned rock is dry; None when unknown."""
         remaining = self.rock_remaining()

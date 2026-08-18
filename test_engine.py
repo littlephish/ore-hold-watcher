@@ -169,8 +169,10 @@ def main():
     assert eng.char("Yuri Urt").rock_remaining() == 875
 
     # warm-up: too few ticks to trust a rate (spec: "showing nothing beats
-    # showing a confident wrong number")
+    # showing a confident wrong number"), and the UI must be able to say so
     assert eng.char("Yuri Urt").rock_eta_s() is None
+    assert eng.char("Yuri Urt").rock_status() == "warmup", \
+        eng.char("Yuri Urt").rock_status()
 
     # ticks before the scan anchor are ignored
     eng._apply_depletion(MiningEvent(character="Yuri Urt", qty=999,
@@ -201,6 +203,11 @@ def main():
     eta = yc.rock_eta_s(now_epoch=ts_to_epoch("2126.07.15 18:04:00"))
     assert eta is not None, "warmed-up rate should yield an ETA"
     approx(eta, 900 / 25.0 * 60.0, tol=1.0)
+    assert yc.rock_status(
+        now_epoch=ts_to_epoch("2126.07.15 18:04:00")) == "ready"
+    # long after the last tick the countdown pauses rather than lying
+    assert yc.rock_status(
+        now_epoch=ts_to_epoch("2126.07.15 23:00:00")) == "idle"
 
     # --- a system change abandons the tracked rock ---
     # Scanner distances are ship-relative and rocks are grid-local, so a rock
