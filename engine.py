@@ -104,6 +104,11 @@ def ts_to_epoch(ts: str) -> float:
 RATE_WINDOW_S = 600   # mining rate = volume over the last 10 minutes
 RATE_IDLE_S = 300     # no cycle for 5 min -> treat as not mining (no ETA)
 
+# A rock rate needs a few real cycles before it means anything - the residue
+# share varies by crystal and ship, so it is measured, never assumed.
+ROCK_WARMUP_TICKS = 3
+ROCK_WARMUP_S = 90.0
+
 
 HOLD_FULL_MARKERS = (
     "ore hold is full",
@@ -195,6 +200,21 @@ class ResidueEvent:
     qty: int          # units removed from the asteroid, NOT added to the hold
     ore: str          # inferred from the preceding mining tick
     ts: str
+
+
+@dataclass
+class TargetRock:
+    """The asteroid a pilot is currently mining, from a survey-scan paste.
+
+    Anchored exactly like CharacterState.anchor_ts/anchor_m3: scan_ts is the
+    moment the snapshot was taken, and only ticks newer than it count against
+    it, so replaying the logs on restart cannot double-count.
+    """
+    ore: str
+    scan_units: int
+    scan_ts: str             # log format "YYYY.MM.DD HH:MM:SS", UTC
+    distance_m: float
+    depleted_units: int = 0  # mined + residue since scan_ts
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +349,43 @@ class CharacterState:
     # logs can't fire it; a recent live mining tick arms it (False), going
     # idle fires once and disarms again until mining resumes
     idle_notified: bool = True
+    # scanned-rock countdown (see TargetRock); persisted via save_state
+    target: "TargetRock | None" = None
+    # rolling (epoch, units) removed from the rock - mined AND residue
+    rock_events: deque = field(default_factory=deque)
+
+    def rock_remaining(self) -> int | None:
+        """Units left in the scanned rock, or None when no rock is targeted."""
+        if not self.target:
+            return None
+        return max(0, self.target.scan_units - self.target.depleted_units)
+
+    def rock_depletion_rate(self, now_epoch: float | None = None) -> float:
+        """Units per minute coming off the rock (mined + residue); 0 when idle
+        or still warming up."""
+        if not self.rock_events:
+            return 0.0
+        now_epoch = now_epoch if now_epoch is not None else time.time()
+        newest = self.rock_events[-1][0]
+        if now_epoch - newest > RATE_IDLE_S:
+            return 0.0
+        oldest = self.rock_events[0][0]
+        span = newest - oldest
+        # Below the warm-up threshold the rate is noise, not a number.
+        if len(self.rock_events) < ROCK_WARMUP_TICKS or span < ROCK_WARMUP_S:
+            return 0.0
+        total = sum(u for _, u in self.rock_events)
+        return total / (span / 60.0)
+
+    def rock_eta_s(self, now_epoch: float | None = None) -> float | None:
+        """Seconds until the scanned rock is dry; None when unknown."""
+        remaining = self.rock_remaining()
+        if not remaining:
+            return None
+        rate = self.rock_depletion_rate(now_epoch)
+        if rate <= 0:
+            return None
+        return remaining / rate * 60.0
 
     def mining_rate_m3_min(self, now_epoch: float | None = None) -> float:
         """Current mining speed in m3/min over the rolling window;
@@ -571,6 +628,55 @@ class Engine:
             c.notified = False
         self.save_state()
 
+    # -- scanned rock ---------------------------------------------------------
+    def set_target(self, character: str, ore: str, units: int,
+                   distance_m: float):
+        """Anchor a scanned rock to a character. Re-pasting re-anchors."""
+        c = self.char(character)
+        c.target = TargetRock(ore=ore, scan_units=int(units), scan_ts=now_ts(),
+                              distance_m=float(distance_m))
+        c.rock_events.clear()
+        log.info("target: %s -> %s %d units @ %.0f m",
+                 character, ore, units, distance_m)
+        self.save_state()
+
+    def clear_target(self, character: str):
+        c = self.chars.get(character)
+        if not c:
+            return
+        c.target = None
+        c.rock_events.clear()
+        self.save_state()
+
+    def rock_popped(self, character: str):
+        """An observed pop (drone stop) outranks arithmetic - spec D4."""
+        c = self.chars.get(character)
+        if c and c.target:
+            log.info("target: %s rock popped (observed)", character)
+            self.clear_target(character)
+
+    def _apply_depletion(self, ev):
+        """Count a mining or residue event against the character's rock.
+
+        Gated on the rock's own scan_ts, independent of the hold anchor, so a
+        calibration newer than the scan cannot silently stop depletion.
+        """
+        c = self.chars.get(ev.character)
+        if not c or not c.target or ev.ore != c.target.ore:
+            return
+        if ev.ts <= c.target.scan_ts:   # log timestamps sort lexicographically
+            return
+        c.target.depleted_units += ev.qty
+        ep = ts_to_epoch(ev.ts)
+        if ep:
+            c.rock_events.append((ep, ev.qty))
+            while (c.rock_events and
+                   ep - c.rock_events[0][0] > RATE_WINDOW_S):
+                c.rock_events.popleft()
+        if c.rock_remaining() <= 0:
+            log.info("target: %s rock exhausted by count", ev.character)
+            self.clear_target(ev.character)
+
     def set_capacity(self, name: str, m3: float):
         c = self.char(name)
         c.capacity = max(1.0, float(m3))
@@ -632,6 +738,14 @@ class Engine:
                 ev = self._parse_line(name, ln)
                 if ev is None:
                     continue
+                # Rock depletion runs BEFORE the hold anchor filter below:
+                # the anchor is about cargo, and a calibration newer than the
+                # scan must not silently freeze the countdown. _apply_depletion
+                # gates on the rock's own scan_ts instead.
+                if isinstance(ev, (MiningEvent, ResidueEvent)):
+                    self._apply_depletion(ev)
+                elif isinstance(ev, DroneStopEvent):
+                    self.rock_popped(ev.character)
                 # anchor filter: log events at/before a character's last
                 # reset/calibration are already baked into anchor_m3 -
                 # skipping them makes startup replay idempotent.

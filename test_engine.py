@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
-                    OreTable, ResidueEvent)
+                    OreTable, ResidueEvent, ts_to_epoch)
 
 HEADER = (
     "------------------------------------------------------------\n"
@@ -145,6 +145,62 @@ def main():
     # --- state persists --------------------------------------------------------
     eng2 = Engine(log_dir=tmp, state_path=tmp / "state.json")
     approx(eng2.char("Nancy Kondur").est_m3, 50000.0)
+
+    # --- scanned rock countdown (spec D1/D4) ---
+    eng.set_target("Yuri Urt", ore="Brimful Coesite", units=1000,
+                   distance_m=726.0)
+    tr = eng.char("Yuri Urt").target
+    assert tr is not None and tr.scan_units == 1000
+
+    # depletion counts mined AND residue (spec F1)
+    eng._apply_depletion(MiningEvent(character="Yuri Urt", qty=100,
+                                     ore="Brimful Coesite", m3=1000.0,
+                                     ts="2126.07.15 16:00:00"))
+    eng._apply_depletion(ResidueEvent(character="Yuri Urt", qty=25,
+                                      ore="Brimful Coesite",
+                                      ts="2126.07.15 16:00:00"))
+    assert eng.char("Yuri Urt").rock_remaining() == 875, \
+        eng.char("Yuri Urt").rock_remaining()
+
+    # a different ore does not deplete this rock
+    eng._apply_depletion(MiningEvent(character="Yuri Urt", qty=500,
+                                     ore="Bitumens", m3=5000.0,
+                                     ts="2126.07.15 16:00:30"))
+    assert eng.char("Yuri Urt").rock_remaining() == 875
+
+    # warm-up: too few ticks to trust a rate (spec: "showing nothing beats
+    # showing a confident wrong number")
+    assert eng.char("Yuri Urt").rock_eta_s() is None
+
+    # ticks before the scan anchor are ignored
+    eng._apply_depletion(MiningEvent(character="Yuri Urt", qty=999,
+                                     ore="Brimful Coesite", m3=9990.0,
+                                     ts="2000.01.01 00:00:00"))
+    assert eng.char("Yuri Urt").rock_remaining() == 875
+
+    # DroneStopEvent zeroes an observed pop regardless of arithmetic (D4)
+    eng.rock_popped("Yuri Urt")
+    assert eng.char("Yuri Urt").target is None
+
+    # over-depletion clears rather than going negative
+    eng.set_target("Yuri Urt", ore="Coesite", units=10, distance_m=5.0)
+    eng._apply_depletion(MiningEvent(character="Yuri Urt", qty=50,
+                                     ore="Coesite", m3=500.0,
+                                     ts="2126.07.15 17:00:00"))
+    assert eng.char("Yuri Urt").target is None
+
+    # a warmed-up rate produces a real ETA
+    eng.set_target("Yuri Urt", ore="Coesite", units=1000, distance_m=5.0)
+    for i in range(5):
+        eng._apply_depletion(MiningEvent(
+            character="Yuri Urt", qty=20, ore="Coesite", m3=200.0,
+            ts=f"2126.07.15 18:{i:02d}:00"))
+    yc = eng.char("Yuri Urt")
+    assert yc.rock_remaining() == 900
+    # 100 units over 4 minutes = 25 units/min -> 900 units = 36 min
+    eta = yc.rock_eta_s(now_epoch=ts_to_epoch("2126.07.15 18:04:00"))
+    assert eta is not None, "warmed-up rate should yield an ETA"
+    approx(eta, 900 / 25.0 * 60.0, tol=1.0)
 
     # --- ore table edge cases ---------------------------------------------------
     t = OreTable()
