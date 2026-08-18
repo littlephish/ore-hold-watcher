@@ -2222,6 +2222,10 @@ class SettingsDialog(DarkDialog):
         self.sde_update = QPushButton("Update ore data from SDE")
         self.sde_update.setToolTip(
             "Download the latest published ore, ice, gas, and variant volumes")
+        self.sde_status = QLabel(
+            f"Runtime catalog: {config_dir() / 'sde_volumes.json'}")
+        self.sde_status.setWordWrap(True)
+        self.sde_status.setStyleSheet("color: #949ba4; font-size: 11px;")
         self.ledger_backfill.setChecked(bool(settings["ledger_backfill_prices"]))
         self.upd_check = QCheckBox("Check GitHub for app updates (daily, from "
                                    + DEFAULT_UPDATE_REPO + ")")
@@ -2252,6 +2256,7 @@ class SettingsDialog(DarkDialog):
         gf.addRow(self.ledger_prices)
         gf.addRow(self.ledger_backfill)
         gf.addRow(self.sde_update)
+        gf.addRow(self.sde_status)
         gf.addRow(self.upd_check)
         gf.addRow(self.dbg)
         gf.addRow(self.open_log)
@@ -2852,6 +2857,9 @@ class MainWindow(QMainWindow):
             dialog.sde_update.setEnabled(True)
             dialog.sde_update.setText("Update ore data from SDE")
             if self._sde_error:
+                dialog.sde_status.setText(
+                    f"SDE update failed; existing catalog kept:\n"
+                    f"{config_dir() / 'sde_volumes.json'}")
                 QMessageBox.warning(dialog, "SDE update failed",
                                     "The existing ore data was kept.\n\n" +
                                     self._sde_error)
@@ -2859,6 +2867,9 @@ class MainWindow(QMainWindow):
             self.engine.reload_sde(sde_catalog_paths())
             dialog.sde_update.setToolTip(
                 f"Updated {self._sde_count:,} published resource volumes")
+            dialog.sde_status.setText(
+                f"Updated {self._sde_count:,} volumes; runtime catalog:\n"
+                f"{config_dir() / 'sde_volumes.json'}")
             self.status.setText(
                 f"SDE data updated: {self._sde_count:,} resource volumes")
             self.refresh()
@@ -3302,6 +3313,10 @@ def main():
     log.info("=== Ore Hold Watcher starting (user=%s) ===", os.environ.get(
         "USERNAME") or os.environ.get("USER") or "?")
     log.info("config dir: %s", config_dir())
+    sde_paths = sde_catalog_paths()
+    log.info("SDE volume catalog path(s): %s",
+             ", ".join(str(p) for p in sde_paths)
+             if sde_paths else "none; using built-in volumes")
     set_app_user_model_id()   # stable taskbar identity, before any window
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
