@@ -1183,6 +1183,36 @@ class CharRow(QWidget):
         lay.setSpacing(4)
         lay.addLayout(top)
         lay.addWidget(self.bar)
+        # Second line, only present when a scanned rock is being tracked
+        # (spec D5) - the window grows only when the feature is in use.
+        self.rock = QLabel("")
+        self.rock.setObjectName("rockLine")
+        self.rock.setVisible(False)
+        lay.addWidget(self.rock)
+
+    ROCK_WARN_S = 60.0    # soft alert threshold (spec D6)
+    ROCK_CRIT_S = 20.0
+
+    def update_rock(self, target, remaining, eta_s, pilot_name):
+        """Second line: what rock, how much left, how long, how stale."""
+        if not target:
+            self.rock.setVisible(False)
+            return
+        age = time.time() - ts_to_epoch(target.scan_ts)
+        eta_txt = fmt_eta(eta_s) if eta_s else "—"
+        # Anchor age and pilot are always shown: a stale number must look
+        # stale (spec D4), and misattribution must be visible (spec D3).
+        self.rock.setText(
+            f"⛏ {target.ore} · {remaining:,} left · dry in {eta_txt}"
+            f" · as of {fmt_dur(age)} · {pilot_name}")
+        colour = "#949ba4"
+        if eta_s is not None:
+            if eta_s <= self.ROCK_CRIT_S:
+                colour = "#f23f43"
+            elif eta_s <= self.ROCK_WARN_S:
+                colour = "#f0b232"
+        self.rock.setStyleSheet(f"color: {colour}; font-size: 11px;")
+        self.rock.setVisible(True)
 
     ARM_STYLES = {
         "armed":   ("⛏ armed",   "#23a55a"),
@@ -2365,6 +2395,8 @@ class MainWindow(QMainWindow):
         self.engine.drone_enabled = bool(self.settings["drone_alert_enabled"])
         self.prices = PriceService()
         self.clients = ClientWatcher(self.settings["eve_process_names"])
+        # character -> scan_ts already warned about; re-arms on re-anchor
+        self._rock_warned: dict[str, str] = {}
         self._last_client_scan = 0.0
         self._last_price_check = 0.0
         self._last_activity_ts = 0.0    # wall-clock of last time-in-state accrual
@@ -2682,6 +2714,27 @@ class MainWindow(QMainWindow):
     def reset_char(self, name: str):
         self.engine.reset(name)
         self.refresh()
+
+    def _rock_alert(self, c):
+        """Soft, local-only warning that a rock is about to run dry (D6).
+
+        Strip miners get no popped-rock line in the log at all (spec F3), so
+        without this a minimised window means no warning. Deliberately NOT
+        routed through Notifier.alert(), which fans out to popup, sound,
+        webhook and ntfy - this alert never leaves the machine.
+        """
+        if not c.target:
+            self._rock_warned.pop(c.name, None)
+            return
+        eta = c.rock_eta_s()
+        if eta is None or eta > CharRow.ROCK_WARN_S:
+            return
+        if self._rock_warned.get(c.name) == c.target.scan_ts:
+            return
+        self._rock_warned[c.name] = c.target.scan_ts
+        if self.settings["notify_overlay"]:
+            self.notifier.overlay.show_alert(
+                f"{self.disp(c.name)}: {c.target.ore} rock nearly dry")
 
     def guess_scan_pilot(self) -> str | None:
         """Best guess at which pilot a pasted scan belongs to (spec D3).
@@ -3130,6 +3183,9 @@ class MainWindow(QMainWindow):
                 arm = "standby"
             row.lbl.setText(self.disp(c.name))
             row.update_state(c.est_m3, c.capacity, c.eta_full_s(), arm)
+            row.update_rock(c.target, c.rock_remaining(), c.rock_eta_s(),
+                            self.disp(c.name))
+            self._rock_alert(c)
         if reorder:
             self._applied_order = wanted
 
