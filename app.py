@@ -1193,21 +1193,14 @@ class CharRow(QWidget):
     ROCK_WARN_S = 60.0    # soft alert threshold (spec D6)
     ROCK_CRIT_S = 20.0
 
-    def update_rock(self, target, remaining, eta_s, pilot_name,
-                    status: str = "ready"):
+    def update_rock(self, target, remaining, eta_s, pilot_name):
         """Second line: what rock, how much left, how long, how stale."""
         if not target:
             self.rock.setVisible(False)
             return
         age = time.time() - ts_to_epoch(target.scan_ts)
-        if eta_s:
-            eta_txt = fmt_eta(eta_s)
-        elif status == "warmup":
-            # A bare dash during warm-up is indistinguishable from a broken
-            # feature. Say what is actually happening.
-            eta_txt = "measuring…"
-        else:
-            eta_txt = "paused"
+        # No ETA yet -> say so. A bare dash reads as a broken feature.
+        eta_txt = fmt_eta(eta_s) if eta_s else "measuring…"
         # Anchor age and pilot are always shown: a stale number must look
         # stale (spec D4), and misattribution must be visible (spec D3).
         self.rock.setText(
@@ -3192,7 +3185,7 @@ class MainWindow(QMainWindow):
             row.lbl.setText(self.disp(c.name))
             row.update_state(c.est_m3, c.capacity, c.eta_full_s(), arm)
             row.update_rock(c.target, c.rock_remaining(), c.rock_eta_s(),
-                            self.disp(c.name), c.rock_status())
+                            self.disp(c.name))
             self._rock_alert(c)
         if reorder:
             self._applied_order = wanted
