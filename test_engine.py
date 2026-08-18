@@ -202,6 +202,28 @@ def main():
     assert eta is not None, "warmed-up rate should yield an ETA"
     approx(eta, 900 / 25.0 * 60.0, tol=1.0)
 
+    # --- target persistence ---
+    sp = tmp / "state_target.json"
+    e1 = Engine(log_dir=tmp, state_path=sp, default_capacity=180000.0)
+    e1.poll()
+    e1.set_target("Yuri Urt", ore="Coesite", units=5000, distance_m=726.0)
+    e1.char("Yuri Urt").target.depleted_units = 1200
+    e1.save_state()
+
+    e2 = Engine(log_dir=tmp, state_path=sp, default_capacity=180000.0)
+    t2 = e2.char("Yuri Urt").target
+    assert t2 is not None, "target did not survive reload"
+    assert t2.ore == "Coesite" and t2.scan_units == 5000
+    assert t2.depleted_units == 1200
+    approx(t2.distance_m, 726.0)
+
+    # a state file with no target key loads cleanly (backward compatible)
+    legacy = tmp / "state_legacy.json"
+    legacy.write_text('{"characters": {"Solo Pilot": {"capacity": 180000.0}}}',
+                      encoding="utf-8")
+    e3 = Engine(log_dir=tmp, state_path=legacy, default_capacity=180000.0)
+    assert e3.char("Solo Pilot").target is None
+
     # --- ore table edge cases ---------------------------------------------------
     t = OreTable()
     approx(t.unit_volume("Compressed Bright Spodumain"), 0.16)

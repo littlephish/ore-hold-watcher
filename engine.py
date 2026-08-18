@@ -496,13 +496,30 @@ class Engine:
                 anchor_ts=str(d.get("anchor_ts", "")),
                 anchor_m3=anchor_m3,
             )
+            td = d.get("target")
+            if isinstance(td, dict) and td.get("ore"):
+                self.chars[name].target = TargetRock(
+                    ore=str(td["ore"]),
+                    scan_units=int(td.get("scan_units", 0)),
+                    scan_ts=str(td.get("scan_ts", "")),
+                    distance_m=float(td.get("distance_m", 0.0)),
+                    depleted_units=int(td.get("depleted_units", 0)),
+                )
 
     def save_state(self):
-        data = {"characters": {
-            c.name: {"capacity": c.capacity, "last_event": c.last_event,
-                     "notified": c.notified, "anchor_ts": c.anchor_ts,
-                     "anchor_m3": c.anchor_m3}
-            for c in self.chars.values()}}
+        chars = {}
+        for c in self.chars.values():
+            d = {"capacity": c.capacity, "last_event": c.last_event,
+                 "notified": c.notified, "anchor_ts": c.anchor_ts,
+                 "anchor_m3": c.anchor_m3}
+            if c.target:
+                d["target"] = {"ore": c.target.ore,
+                               "scan_units": c.target.scan_units,
+                               "scan_ts": c.target.scan_ts,
+                               "distance_m": c.target.distance_m,
+                               "depleted_units": c.target.depleted_units}
+            chars[c.name] = d
+        data = {"characters": chars}
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             self.state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
