@@ -35,16 +35,17 @@ log = logging.getLogger("orewatcher.app")
 from PySide6.QtCore import Qt, QTimer, QSize, QRect
 from PySide6.QtGui import (QAction, QBrush, QColor, QIcon, QPainter, QPen,
                            QPixmap, QFont)
-from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox,
-                               QDoubleSpinBox, QFileDialog, QFormLayout,
-                               QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-                               QMainWindow, QMenu, QMessageBox, QProgressBar,
-                               QPushButton, QScrollArea, QSpinBox,
-                               QSystemTrayIcon, QVBoxLayout, QWidget,
-                               QCheckBox)
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog,
+                               QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+                               QFormLayout, QHBoxLayout, QInputDialog, QLabel,
+                               QLineEdit, QMainWindow, QMenu, QMessageBox,
+                               QPlainTextEdit, QProgressBar, QPushButton,
+                               QScrollArea, QSpinBox, QSystemTrayIcon,
+                               QVBoxLayout, QWidget, QCheckBox)
 
 from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
                     CombatEvent, DroneStopEvent, ts_to_epoch)
+from scan import parse_scan
 
 APP_NAME = "Ore Hold Watcher"
 ORG_DIR = "OreHoldWatcher"
@@ -1224,6 +1225,9 @@ class CharRow(QWidget):
         m.addAction("Set current m³…", lambda: self.main.calibrate_char(self.name))
         m.addAction("Set capacity…", lambda: self.main.capacity_char(self.name))
         m.addSeparator()
+        m.addAction("Paste survey scan…",
+                    lambda: ScanPasteDialog(self.main, self.name).exec())
+        m.addSeparator()
         m.addAction("Remove from list", lambda: self.main.remove_char(self.name))
         m.exec(self.mapToGlobal(pos))
 
@@ -1932,6 +1936,113 @@ class OreHoldInfoDialog(DarkDialog):
             self.chosen = float(it.text(1 if base else 2).replace(",", ""))
             self.accept()
 
+
+class ScanPasteDialog(DarkDialog):
+    """Paste survey-scanner output, pick the rock being mined, arm a countdown.
+
+    The rock is auto-proposed as the nearest one whose ore matches what the
+    pilot is mining (spec D2) and the pilot from the last-focused client
+    (spec D3). Both are dropdowns: the guess is visible, so being wrong is
+    cheap.
+    """
+
+    def __init__(self, main: "MainWindow", preselect_pilot: str | None = None):
+        super().__init__(main)
+        self.main = main
+        self.rows: list = []
+        self.setWindowTitle("Paste survey scan")
+        self.resize(560, 520)
+
+        self.paste = QPlainTextEdit()
+        self.paste.setPlaceholderText(
+            "Select all rows in the survey scanner window, copy, paste here.")
+        self.paste.textChanged.connect(self.reparse)
+
+        self.pilot = QComboBox()
+        self.pilot.addItem("- select pilot -", None)
+        for name in sorted(main.engine.chars):
+            self.pilot.addItem(name, name)
+        guess = preselect_pilot or main.guess_scan_pilot()
+        if guess:
+            i = self.pilot.findData(guess)
+            if i >= 0:
+                self.pilot.setCurrentIndex(i)
+        self.pilot.currentIndexChanged.connect(lambda *_: self.preselect_rock())
+
+        self.rock = QComboBox()
+        self.warn = QLabel("")
+        self.warn.setWordWrap(True)
+        self.warn.setStyleSheet("color: #f0b232;")
+
+        self.ok = QPushButton("Track this rock")
+        self.ok.clicked.connect(self.accept_target)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.ok)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Survey scanner results:"))
+        lay.addWidget(self.paste, 1)
+        lay.addWidget(self.warn)
+        lay.addWidget(QLabel("Pilot:"))
+        lay.addWidget(self.pilot)
+        lay.addWidget(QLabel("Rock being mined:"))
+        lay.addWidget(self.rock)
+        lay.addLayout(buttons)
+        self.reparse()
+
+    def reparse(self):
+        text = self.paste.toPlainText()
+        self.rows, warnings = parse_scan(text, self.main.engine.table)
+        self.rock.clear()
+        # nearest first: the locked rock is the close one (spec F5)
+        for r in sorted(self.rows, key=lambda r: r.distance_m):
+            dist = (f"{r.distance_m:,.0f} m" if r.distance_m < 1000
+                    else f"{r.distance_m / 1000:,.0f} km")
+            self.rock.addItem(f"{r.ore} · {r.units:,} units · {dist}", r)
+        self.preselect_rock()
+        if warnings:
+            shown = warnings[:3]
+            more = (f" (+{len(warnings) - 3} more)" if len(warnings) > 3 else "")
+            self.warn.setText(" ".join(shown) + more)
+        else:
+            self.warn.setText("")
+        self.ok.setEnabled(bool(self.rows))
+
+    def preselect_rock(self):
+        """Nearest rock whose ore matches what this pilot is mining."""
+        who = self.pilot.currentData()
+        ore = None
+        if who:
+            tick = self.main.engine._last_tick.get(who)
+            ore = tick[1] if tick else None
+        if not ore or not self.rows:
+            return
+        for i in range(self.rock.count()):
+            row = self.rock.itemData(i)
+            if row is not None and row.ore == ore:
+                self.rock.setCurrentIndex(i)   # list is nearest-first
+                return
+
+    def accept_target(self):
+        who = self.pilot.currentData()
+        row = self.rock.currentData()
+        if not who:
+            self.warn.setText("Pick which pilot this scan came from.")
+            return
+        if row is None:
+            self.warn.setText("Pick the rock being mined.")
+            return
+        self.main.engine.set_target(who, ore=row.ore, units=row.units,
+                                    distance_m=row.distance_m)
+        self.main.refresh()
+        self.accept()
+
+
 class SettingsDialog(DarkDialog):
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
@@ -2332,6 +2443,8 @@ class MainWindow(QMainWindow):
         menu = QMenu()
         menu.addAction("Show / Hide", self.toggle_visible)
         menu.addAction("Recalculate from logs", self.recalculate)
+        menu.addAction("Paste survey scan…",
+                       lambda: ScanPasteDialog(self).exec())
         menu.addAction("Reset all holds to 0", self.reset_all)
         menu.addAction("Check for updates", self.manual_update_check)
         menu.addSeparator()
