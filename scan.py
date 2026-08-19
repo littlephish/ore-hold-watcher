@@ -69,7 +69,10 @@ def parse_scan(text: str, table) -> tuple[list[ScanRow], list[str]]:
             continue
         parts = [p.strip() for p in line.split("\t")]
         if len(parts) < 5:
-            warnings.append(f"Skipped unparseable line: {line[:60]!r}")
+            if table.unit_volume(line) is not None:
+                warnings.append(f"Ore section not expanded: {line}")
+            else:
+                warnings.append(f"Skipped unparseable line: {line[:60]!r}")
             continue
 
         ore = parts[0]

@@ -92,6 +92,16 @@ def main():
     rows_j, warn_j = parse_scan("not a scan at all", table)
     assert rows_j == [] and warn_j
 
+    # The scan window includes collapsed ore-section labels without columns.
+    rows_sections, warn_sections = parse_scan(
+        "Brimful Bitumens\nBrimful Coesite\nZeolites", table)
+    assert rows_sections == []
+    assert warn_sections == [
+        "Ore section not expanded: Brimful Bitumens",
+        "Ore section not expanded: Brimful Coesite",
+        "Ore section not expanded: Zeolites",
+    ]
+
     # blank lines and trailing whitespace tolerated
     rows_w, _ = parse_scan("\n  \n" + SAMPLE + "\n\n", table)
     assert len(rows_w) == 6
