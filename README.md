@@ -21,6 +21,12 @@ top of that:
 - Survey-scan rock countdown: paste the scanner results and each pilot gets a
   live "dry in 4m12s" for the rock they're on. It counts mined *and* residue
   units, so it tracks the rock draining ~25% faster than your hold fills.
+  The rate is measured per mining *cycle* from that pilot's own recent ticks,
+  so if they were already mining that ore the countdown is live immediately;
+  from a cold start it needs about 30 seconds. Track a rock of an ore the
+  pilot isn't actually shooting and the row says "stalled: mining X" instead
+  of a countdown that can never move - the gamelog names the ore on every
+  tick, so this is checked, and the paste dialog warns you up front.
   Soft on-screen warning only - never sent to Discord or your phone.
   Scanner distances are measured from the scanning ship, so paste **each
   miner's own scan** (right-click that pilot's row - it preselects them) and
@@ -162,6 +168,13 @@ send real names - this only changes what's on screen.
 
 Colors everywhere mean the same thing: green below 75%, amber 75 to 90%,
 red above 90%.
+
+Blue is a separate channel and never means fill: it is always the survey-scan
+rock countdown. It shows up as a thin bar under a pilot's fill bar, and as an
+inner ring inside the tray/taskbar gauge (that one follows whichever rock in
+the fleet runs dry first - hover the tray for which pilot and which ore). Both
+start full when you paste a scan and drain back toward the start, the mirror
+of the fill bar growing away from it.
 
 ## Daily mining ledger
 

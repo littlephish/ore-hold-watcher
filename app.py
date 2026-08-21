@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog,
                                QVBoxLayout, QWidget, QCheckBox)
 
 from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
-                    CombatEvent, DroneStopEvent, ts_to_epoch)
+                    CombatEvent, DroneStopEvent, fastest_rock, ts_to_epoch)
 from scan import parse_scan
 from sde import update_catalog
 
@@ -936,8 +936,22 @@ def fill_color(pct: float) -> str:
     return "#23a55a"       # green
 
 
-def make_gauge_pixmap(pct: float) -> QPixmap:
-    """Donut gauge colored by the fullest character."""
+# Scanned-rock countdown ring. Blue is a channel the fill ring never uses
+# (green/amber/red), so "how full am I" and "how long has this rock got" stay
+# readable as two separate things at 16 px.
+ROCK_RING = "#3987e5"
+ROCK_TRACK = "#1e3a5c"
+
+
+def make_gauge_pixmap(pct: float, rock_frac: float | None = None) -> QPixmap:
+    """Donut gauge colored by the fullest character.
+
+    `rock_frac` (0..1) adds an inner blue countdown ring for the scanned rock
+    that will run dry first. It is the inverse of the fill ring: it starts
+    FULL the moment a scan is pasted and unwinds counter-clockwise back to 12
+    o'clock as the rock is chewed through. None (no rock tracked) draws no
+    inner ring at all, so the icon stays quiet when the feature isn't in use.
+    """
     size = 64
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
@@ -949,9 +963,22 @@ def make_gauge_pixmap(pct: float) -> QPixmap:
     if pct > 0:
         p.setPen(QPen(QColor(fill_color(pct)), 10, Qt.SolidLine, Qt.RoundCap))
         p.drawArc(rect, 90 * 16, -int(360 * 16 * min(pct, 100) / 100))
+    num_px = 22
+    if rock_frac is not None:
+        # Geometry picked by eye at both sizes: 3 px of clear canvas between
+        # the rings (at 16 px that is the difference between two rings and one
+        # fat smudge) and enough middle left over that "99" never touches it.
+        inner = pm.rect().adjusted(16, 16, -16, -16)
+        p.setPen(QPen(QColor(ROCK_TRACK), 4))
+        p.drawArc(inner, 0, 360 * 16)   # track: "a rock IS being tracked"
+        if rock_frac > 0:
+            p.setPen(QPen(QColor(ROCK_RING), 4, Qt.SolidLine, Qt.RoundCap))
+            # positive sweep = counter-clockwise = the mirror of the fill ring
+            p.drawArc(inner, 90 * 16, int(360 * 16 * min(rock_frac, 1.0)))
+        num_px = 18                     # shrink to clear the inner ring
     p.setPen(QColor("#dbdee1"))
     f = QFont()
-    f.setPixelSize(22)
+    f.setPixelSize(num_px)
     f.setBold(True)
     p.setFont(f)
     p.drawText(pm.rect(), Qt.AlignCenter, f"{int(round(min(pct, 99)))}")
@@ -959,8 +986,8 @@ def make_gauge_pixmap(pct: float) -> QPixmap:
     return pm
 
 
-def make_tray_icon(pct: float) -> QIcon:
-    return QIcon(make_gauge_pixmap(pct))
+def make_tray_icon(pct: float, rock_frac: float | None = None) -> QIcon:
+    return QIcon(make_gauge_pixmap(pct, rock_frac))
 
 
 # ---------------------------------------------------------------------------
@@ -1191,8 +1218,23 @@ class CharRow(QWidget):
         lay.setSpacing(4)
         lay.addLayout(top)
         lay.addWidget(self.bar)
-        # Second line, only present when a scanned rock is being tracked
+        # Rock countdown: the row's answer to the tray gauge's inner ring.
+        # Same blue, same anchor as the fill bar above it, opposite direction -
+        # it starts full when the scan lands and drains back to the left edge.
+        # Thinner (5 px vs 8) so it reads as subordinate to the hold bar, and
+        # both it and the line below only exist while a rock is tracked
         # (spec D5) - the window grows only when the feature is in use.
+        self.rockbar = QProgressBar()
+        self.rockbar.setRange(0, 1000)
+        self.rockbar.setTextVisible(False)
+        self.rockbar.setFixedHeight(5)
+        self.rockbar.setStyleSheet(
+            f"QProgressBar {{ background: {ROCK_TRACK}; border: none; "
+            f"border-radius: 2px; }} "
+            f"QProgressBar::chunk {{ background: {ROCK_RING}; "
+            f"border-radius: 2px; }}")
+        self.rockbar.setVisible(False)
+        lay.addWidget(self.rockbar)
         self.rock = QLabel("")
         self.rock.setObjectName("rockLine")
         self.rock.setVisible(False)
@@ -1201,21 +1243,40 @@ class CharRow(QWidget):
     ROCK_WARN_S = 60.0    # soft alert threshold (spec D6)
     ROCK_CRIT_S = 20.0
 
-    def update_rock(self, target, remaining, eta_s, pilot_name):
+    def update_rock(self, target, remaining, eta_s, pilot_name,
+                    status=None, other_ore=None):
         """Second line: what rock, how much left, how long, how stale."""
         if not target:
             self.rock.setVisible(False)
+            self.rockbar.setVisible(False)
             return
+        # Units left / units at scan - the same figure the tray ring uses, and
+        # deliberately not a time ratio: it exists from the moment the scan is
+        # pasted and only ever moves down (see engine.fastest_rock).
+        left = max(0, remaining or 0)
+        self.rockbar.setValue(int(1000 * left / max(1, target.scan_units)))
+        self.rockbar.setToolTip(
+            f"{target.ore}: {left:,} of {target.scan_units:,} units left")
+        self.rockbar.setVisible(True)
         age = time.time() - ts_to_epoch(target.scan_ts)
-        # No ETA yet -> say so. A bare dash reads as a broken feature.
-        eta_txt = fmt_eta(eta_s) if eta_s else "measuring…"
+        # Mining a different ore is the one state that looks fine and is not:
+        # the count cannot move, so "dry in ..." would be a countdown frozen
+        # forever. Say which ore is actually being mined - the log names it on
+        # every tick - so the wrong rock is obvious instead of silent.
+        if status == "mismatch" and other_ore:
+            middle = f"stalled: mining {other_ore}"
+        else:
+            # No ETA yet -> say so. A bare dash reads as a broken feature.
+            middle = f"dry in {fmt_eta(eta_s) if eta_s else 'measuring…'}"
         # Anchor age and pilot are always shown: a stale number must look
         # stale (spec D4), and misattribution must be visible (spec D3).
         self.rock.setText(
-            f"⛏ {target.ore} · {remaining:,} left · dry in {eta_txt}"
+            f"⛏ {target.ore} · {remaining:,} left · {middle}"
             f" · as of {fmt_dur(age)} · {pilot_name}")
         colour = "#949ba4"
-        if eta_s is not None:
+        if status == "mismatch":
+            colour = "#f0b232"
+        elif eta_s is not None:
             if eta_s <= self.ROCK_CRIT_S:
                 colour = "#f23f43"
             elif eta_s <= self.ROCK_WARN_S:
@@ -2009,6 +2070,11 @@ class ScanPasteDialog(DarkDialog):
         self.pilot.currentIndexChanged.connect(lambda *_: self.preselect_rock())
 
         self.rock = QComboBox()
+        self.rock.currentIndexChanged.connect(lambda *_: self.check_match())
+        self.mismatch = QLabel("")
+        self.mismatch.setWordWrap(True)
+        self.mismatch.setStyleSheet("color: #f0b232; font-size: 12px;")
+        self.mismatch.setVisible(False)
         self.warn = QLabel("")
         self.warn.setWordWrap(True)
         self.warn.setStyleSheet("color: #f0b232;")
@@ -2031,6 +2097,7 @@ class ScanPasteDialog(DarkDialog):
         lay.addWidget(self.pilot)
         lay.addWidget(QLabel("Rock being mined:"))
         lay.addWidget(self.rock)
+        lay.addWidget(self.mismatch)
         lay.addLayout(buttons)
         self.reparse()
 
@@ -2052,20 +2119,41 @@ class ScanPasteDialog(DarkDialog):
             self.warn.setText("")
         self.ok.setEnabled(bool(self.rows))
 
+    def mining_ore(self) -> str | None:
+        """What the selected pilot is ticking right now, per the gamelog."""
+        who = self.pilot.currentData()
+        c = self.main.engine.chars.get(who) if who else None
+        return c.mining_ore() if c else None
+
     def preselect_rock(self):
         """Nearest rock whose ore matches what this pilot is mining."""
-        who = self.pilot.currentData()
-        ore = None
-        if who:
-            tick = self.main.engine._last_tick.get(who)
-            ore = tick[1] if tick else None
-        if not ore or not self.rows:
+        ore = self.mining_ore()
+        if ore and self.rows:
+            for i in range(self.rock.count()):
+                row = self.rock.itemData(i)
+                if row is not None and row.ore == ore:
+                    self.rock.setCurrentIndex(i)   # list is nearest-first
+                    break
+        self.check_match()
+
+    def check_match(self):
+        """Flag a rock whose ore is not the one this pilot is mining.
+
+        Tracking the wrong rock fails silently - no tick ever matches it, so
+        the countdown just sits at its scanned figure looking healthy. The
+        gamelog names the ore on every tick, so this is checkable, and the
+        moment to say so is before the rock is armed, not an hour later.
+        """
+        row = self.rock.currentData()
+        ore = self.mining_ore()
+        if row is None or not ore or row.ore == ore:
+            self.mismatch.setVisible(False)
             return
-        for i in range(self.rock.count()):
-            row = self.rock.itemData(i)
-            if row is not None and row.ore == ore:
-                self.rock.setCurrentIndex(i)   # list is nearest-first
-                return
+        self.mismatch.setText(
+            f"⚠ This pilot is mining {ore}, not {row.ore}. Tracking a rock "
+            f"they are not shooting will never count down - pick the "
+            f"{ore} rock they have locked, unless you are about to switch.")
+        self.mismatch.setVisible(True)
 
     def accept_target(self):
         who = self.pilot.currentData()
@@ -2417,6 +2505,10 @@ class MainWindow(QMainWindow):
         # character -> scan_ts already warned about; re-arms on re-anchor
         self._rock_warned: dict[str, str] = {}
         self._last_client_scan = 0.0
+        # scanned rocks restored from disk are provisional until the first
+        # poll has replayed the logs and we can see whether they are still
+        # being mined (see Engine.drop_stale_targets)
+        self._rock_startup_swept = False
         self._last_price_check = 0.0
         self._last_activity_ts = 0.0    # wall-clock of last time-in-state accrual
         self._last_activity_save = 0.0  # throttle ledger writes for activity
@@ -2482,7 +2574,7 @@ class MainWindow(QMainWindow):
         # poll_seconds for alerting, but the (much heavier) visual refresh is
         # rate-limited and only repaints tray/rows when values actually change
         self._last_refresh = 0.0
-        self._tray_icon_key = None    # last pct the gauge was painted for
+        self._tray_icon_key = None    # last (pct, rock_frac) painted
         self._gauge_pixmap = None     # cached gauge; repainted only on pct change
         self._tray_tip = ""
         self._win_title = ""
@@ -3126,6 +3218,20 @@ class MainWindow(QMainWindow):
                     self.notify("Unknown ore type",
                                 f"'{ev.ore}' isn't in the volume table - add it to "
                                 f"ores_override.json (Settings folder) so it counts.")
+        # --- scanned-rock invalidation ------------------------------------
+        # A closed client is a blind spot: docking, ship swaps and belt hops
+        # all happen unseen, so the rock stops being provable the moment the
+        # client goes away. Runs every tick, so it catches both a client that
+        # closed while we watched and one already gone at startup.
+        for c in list(self.engine.chars.values()):
+            if c.target and is_closed(c.name):
+                self.engine.client_closed(c.name)
+        # First tick only: the state file restored these rocks, but the replay
+        # above is what decides whether they are still real (spec D4).
+        if not self._rock_startup_swept:
+            self._rock_startup_swept = True
+            for name in self.engine.drop_stale_targets(now_utc):
+                log.info("startup: dropped stale rock for %s", name)
         # threshold crossings / re-arm
         for c in self.engine.chars.values():
             if c.pct >= threshold and not c.notified:
@@ -3182,10 +3288,16 @@ class MainWindow(QMainWindow):
         # Repainting the icon and calling setIcon (a Win32 shell notify) every
         # tick was the bulk of the idle CPU. ---
         max_pct = max((c.pct for c in chars), default=0.0)
-        icon_key = round(min(max_pct, 100.0), 1)
+        # inner ring: the rock that runs dry first, anywhere in the fleet
+        rock = fastest_rock(chars)
+        # Quantized to 2% steps and folded into the cache key, so the rock
+        # ring costs at most ~50 repaints over a rock's whole life instead of
+        # one per tick. Paint the QUANTIZED value so pixels match the key.
+        rock_key = None if rock is None else round(rock.fraction * 50) / 50
+        icon_key = (round(min(max_pct, 100.0), 1), rock_key)
         if icon_key != self._tray_icon_key:
             self._tray_icon_key = icon_key
-            self._gauge_pixmap = make_gauge_pixmap(max_pct)  # repaint on change
+            self._gauge_pixmap = make_gauge_pixmap(max_pct, rock_key)  # repaint
             self.tray.setIcon(QIcon(self._gauge_pixmap))     # tray: shell call
         # Windows 11's taskbar button ignores a repeated identical QIcon and
         # drops the icon when the native window is recreated (always-on-top
@@ -3204,6 +3316,11 @@ class MainWindow(QMainWindow):
             return (f"{c.pct:.1f}%  {self.disp(c.name)}" +
                     (f"  ({fmt_eta(eta)})" if eta else ""))
         tip = "\n".join(tip_line(c) for c in chars[:8]) or APP_NAME
+        # A blue ring on its own is a riddle; the tooltip says what it means.
+        if rock:
+            eta_txt = fmt_eta(rock.eta_s) if rock.eta_s else "measuring…"
+            tip += (f"\n⛏ {rock.ore} · {rock.remaining:,} left · dry in "
+                    f"{eta_txt} · {self.disp(rock.character)}")
         if tip != self._tray_tip:
             self._tray_tip = tip
             self.tray.setToolTip(tip)
@@ -3254,7 +3371,8 @@ class MainWindow(QMainWindow):
             row.lbl.setText(self.disp(c.name))
             row.update_state(c.est_m3, c.capacity, c.eta_full_s(), arm)
             row.update_rock(c.target, c.rock_remaining(), c.rock_eta_s(),
-                            self.disp(c.name))
+                            self.disp(c.name), c.rock_status(),
+                            c.mining_ore())
             self._rock_alert(c)
         if reorder:
             self._applied_order = wanted

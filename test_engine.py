@@ -5,8 +5,9 @@ import tempfile
 import time
 from pathlib import Path
 
-from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
-                    OreTable, ResidueEvent, ts_to_epoch)
+from engine import (CharacterState, Engine, MiningEvent, HoldFullEvent,
+                    UnknownOreEvent, OreTable, ResidueEvent, TargetRock,
+                    fastest_rock, tick_bursts, ts_to_epoch)
 
 HEADER = (
     "------------------------------------------------------------\n"
@@ -199,10 +200,14 @@ def main():
             ts=f"2126.07.15 18:{i:02d}:00"))
     yc = eng.char("Yuri Urt")
     assert yc.rock_remaining() == 900
-    # 100 units over 4 minutes = 25 units/min -> 900 units = 36 min
+    # 5 bursts one minute apart, 20 units each. The rate is what one CYCLE
+    # removes: 20 units/min -> 900 units = 45 min. Counting all 5 bursts'
+    # units across the 4-minute span they straddle would say 25 units/min,
+    # a 25% overshoot, because the first burst was removed before the window
+    # opened.
     eta = yc.rock_eta_s(now_epoch=ts_to_epoch("2126.07.15 18:04:00"))
     assert eta is not None, "warmed-up rate should yield an ETA"
-    approx(eta, 900 / 25.0 * 60.0, tol=1.0)
+    approx(eta, 900 / 20.0 * 60.0, tol=1.0)
     assert yc.rock_status(
         now_epoch=ts_to_epoch("2126.07.15 18:04:00")) == "ready"
     # long after the last tick the countdown pauses rather than lying
@@ -248,6 +253,100 @@ def main():
     assert t2.depleted_units == 1200
     approx(t2.distance_m, 726.0)
 
+    # --- rate measurement: cycles, not log lines -------------------------------
+    # A three-laser volley plus its residue line is ONE cycle. Counting the
+    # lines would claim four times the evidence and, with a 2 s span, an
+    # absurd rate.
+    volley = [(0.0, 13), (2.0, 13), (3.0, 13), (3.0, 13),
+              (60.0, 13), (61.0, 13), (62.0, 14)]
+    b = tick_bursts(volley)
+    assert len(b) == 2, b
+    assert b[0] == (0.0, 52) and b[1] == (60.0, 40), b
+
+    # a rock whose ore is already being mined has a rate the moment it is
+    # armed - the ship's history is the ship's history, scan or no scan
+    warm = Engine(log_dir=tmp, state_path=tmp / "state_warm.json")
+    wc = warm.char("Yuri Urt")
+    T = 2_000_000.0
+    for i in range(4):          # 4 bursts, 40 s apart, 20 units each
+        wc.note_tick(T + i * 40, "Zeolites", 20)
+    warm.set_target("Yuri Urt", ore="Zeolites", units=1200, distance_m=253.0)
+    NOWW = T + 120
+    assert wc.rock_status(NOWW) == "ready", "history must survive set_target"
+    # 3 bursts of work (the first only opens the window) over 120 s = 30/min
+    approx(wc.rock_depletion_rate(NOWW), 30.0, tol=0.1)
+    approx(wc.rock_eta_s(NOWW), 1200 / 30.0 * 60.0, tol=1.0)
+
+    # ...and a span too short to be a real cycle still refuses to guess
+    quick = CharacterState(name="Q")
+    quick.target = TargetRock(ore="Zeolites", scan_units=1000,
+                              scan_ts="2026.08.21 00:00:00", distance_m=10.0)
+    quick.note_tick(T, "Zeolites", 13)
+    quick.note_tick(T + 2, "Zeolites", 13)      # same volley
+    quick.note_tick(T + 20, "Zeolites", 13)     # next cycle, span 20 s < 30
+    assert quick.rock_status(T + 20) == "warmup"
+    assert quick.rock_eta_s(T + 20) is None
+
+    # --- mining a different ore is reported, not silently frozen --------------
+    # The exact shape of a mis-picked rock: pilot is chewing Zeolites, the
+    # tracked rock is Bitumens, so nothing can ever count down.
+    mis = CharacterState(name="Yuri Urt")
+    mis.target = TargetRock(ore="Bitumens", scan_units=5196,
+                            scan_ts="2026.08.21 14:29:37", distance_m=253.0)
+    for i in range(4):
+        mis.note_tick(T + i * 40, "Zeolites", 13)
+    assert mis.mining_ore(T + 120) == "Zeolites"
+    assert mis.rock_status(T + 120) == "mismatch"
+    assert mis.rock_eta_s(T + 120) is None
+    assert mis.rock_active(T + 120) is False,         "ticks for another ore must never count as being on this rock"
+    # once they stop entirely it is plain idleness, not a mix-up
+    assert mis.rock_status(T + 5000) == "idle"
+
+    # --- restored rocks are provisional: kept only while still being mined ---
+    # The reload above proves the rock SURVIVES a restart. These prove it only
+    # survives when the replayed log shows the pilot still on it.
+    sp2 = tmp / "state_stale.json"
+    e4 = Engine(log_dir=tmp, state_path=sp2, default_capacity=180000.0)
+    e4.set_target("Yuri Urt", ore="Coesite", units=5000, distance_m=726.0)
+    yu = e4.char("Yuri Urt")
+
+    # nothing replayed for this rock yet -> not provably being mined. This is
+    # the exact state a freshly reloaded target is in.
+    assert yu.rock_status() == "idle"
+    assert yu.rock_active() is False
+    assert e4.drop_stale_targets() == ["Yuri Urt"]
+    assert yu.target is None, "a rock with no live ticks must not be restored"
+
+    # a rock with a tick inside RATE_IDLE_S survives the sweep
+    e4.set_target("Yuri Urt", ore="Coesite", units=5000, distance_m=726.0)
+    T0 = ts_to_epoch("2126.07.15 20:00:00")
+    e4._apply_depletion(MiningEvent(character="Yuri Urt", qty=100,
+                                    ore="Coesite", m3=1000.0,
+                                    ts="2126.07.15 20:00:00"))
+    assert e4.char("Yuri Urt").rock_active(T0 + 60) is True
+    assert e4.drop_stale_targets(T0 + 60) == []
+    assert e4.char("Yuri Urt").target is not None
+    # ...and is dropped once those ticks age past it (RATE_IDLE_S = 5 min)
+    assert e4.char("Yuri Urt").rock_active(T0 + 301) is False
+    assert e4.drop_stale_targets(T0 + 301) == ["Yuri Urt"]
+    assert e4.char("Yuri Urt").target is None
+
+    # ticks for a DIFFERENT ore never count as "still on this rock": the log
+    # names the ore on every tick, so this is checked, not assumed
+    e4.set_target("Yuri Urt", ore="Coesite", units=5000, distance_m=726.0)
+    e4._apply_depletion(MiningEvent(character="Yuri Urt", qty=100,
+                                    ore="Bitumens", m3=1000.0,
+                                    ts="2126.07.15 21:00:00"))
+    assert e4.char("Yuri Urt").rock_active(
+        ts_to_epoch("2126.07.15 21:00:30")) is False
+
+    # a closed client drops the rock, and says so; a second call is a no-op
+    e4.set_target("Yuri Urt", ore="Coesite", units=5000, distance_m=726.0)
+    assert e4.client_closed("Yuri Urt") is True
+    assert e4.char("Yuri Urt").target is None
+    assert e4.client_closed("Yuri Urt") is False
+    assert e4.client_closed("Nobody At All") is False
+
     # a state file with no target key loads cleanly (backward compatible)
     legacy = tmp / "state_legacy.json"
     legacy.write_text('{"characters": {"Solo Pilot": {"capacity": 180000.0}}}',
@@ -261,6 +360,56 @@ def main():
     approx(t.unit_volume("Compressed Thick Blue Ice"), 100.0)
     approx(t.unit_volume("Magma Mercoxit"), 40.0)
     assert t.unit_volume("Tritanium") is None
+
+    # --- fastest_rock: which countdown drives the gauge's inner ring -----------
+    def rock_char(name, ore, units, left, rate_per_min=None, now=1_000_000.0):
+        """A CharacterState with a scanned rock and, optionally, a live rate.
+
+        rate_per_min=None leaves rock_events empty -> warm-up -> no ETA.
+        """
+        c = CharacterState(name=name)
+        c.target = TargetRock(ore=ore, scan_units=units,
+                              scan_ts="2026.07.15 12:00:00",
+                              distance_m=1000.0,
+                              depleted_units=units - left)
+        if rate_per_min:
+            # 4 bursts 40 s apart clears ROCK_WARMUP_BURSTS/ROCK_WARMUP_S.
+            # The first burst is the window's opening edge and contributes no
+            # units to the rate, so 3 bursts of work span 120 s.
+            per_burst = rate_per_min * 2.0 / 3
+            for i in range(4):
+                c.note_tick(now - 120 + i * 40, ore, per_burst)
+        return c
+
+    NOW = 1_000_000.0
+    assert fastest_rock([]) is None
+    # a dry rock is nothing to count down
+    assert fastest_rock([rock_char("A", "Coesite", 5000, 0, 100)], NOW) is None
+
+    # soonest ETA wins even though it has proportionally MORE rock left
+    a = rock_char("A", "Coesite", 10000, 8000, 4000)    # 80% left, 2 min
+    b = rock_char("B", "Bitumens", 10000, 2000, 200)    # 20% left, 10 min
+    r = fastest_rock([b, a], NOW)
+    assert r.character == "A" and r.ore == "Coesite" and r.remaining == 8000
+    approx(r.fraction, 0.8)
+    approx(r.eta_s, 120.0, tol=1.0)
+
+    # no ETA yet (warm-up/idle) sorts last, but still draws a ring...
+    c = rock_char("C", "Veldspar", 10000, 9000)
+    assert fastest_rock([c, b], NOW).character == "B"
+    solo = fastest_rock([c], NOW)
+    assert solo.character == "C" and solo.eta_s is None
+    approx(solo.fraction, 0.9)
+    # ...and among ETA-less rocks the emptiest one wins
+    d = rock_char("D", "Scordite", 10000, 3000)
+    assert fastest_rock([c, d], NOW).character == "D"
+
+    # residue overshoot clamps at empty instead of a negative ring
+    over = rock_char("E", "Omber", 10000, -500)
+    assert fastest_rock([over], NOW) is None
+
+    # a character with no rock at all is simply skipped
+    assert fastest_rock([CharacterState(name="F"), d], NOW).character == "D"
 
     print("\nALL TESTS PASSED")
 

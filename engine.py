@@ -114,10 +114,20 @@ def ts_to_epoch(ts: str) -> float:
 RATE_WINDOW_S = 600   # mining rate = volume over the last 10 minutes
 RATE_IDLE_S = 300     # no cycle for 5 min -> treat as not mining (no ETA)
 
-# A rock rate needs a few real cycles before it means anything - the residue
-# share varies by crystal and ship, so it is measured, never assumed.
-ROCK_WARMUP_TICKS = 3
-ROCK_WARMUP_S = 90.0
+# Ticks arrive in BURSTS, not one at a time: several lasers on one ship land
+# within a few seconds of each other, and a residue line lands within 2 s of
+# the tick it belongs to. Anything closer together than this is the same
+# cycle, so counting raw lines badly overstates how much evidence we have.
+# Measured against real logs: 3-laser bursts land inside ~3 s, cycles repeat
+# every 30-60 s.
+BURST_GAP_S = 10.0
+
+# A rock rate needs one full cycle between bursts before it means anything -
+# the residue share varies by crystal and ship, so it is measured, never
+# assumed. The span floor only rejects gaps too short to be a real cycle;
+# two lasers firing 2 s apart must never read as 780 units/min.
+ROCK_WARMUP_BURSTS = 2
+ROCK_WARMUP_S = 30.0
 
 
 HOLD_FULL_MARKERS = (
@@ -394,8 +404,38 @@ class CharacterState:
     idle_notified: bool = True
     # scanned-rock countdown (see TargetRock); persisted via save_state
     target: "TargetRock | None" = None
-    # rolling (epoch, units) removed from the rock - mined AND residue
-    rock_events: deque = field(default_factory=deque)
+    # rolling (epoch, ore, units) for EVERY ore this pilot ticked - mined AND
+    # residue. Rate history is a property of the ship, not of the rock, so it
+    # is kept per ore and independent of any scan anchor: that is what lets a
+    # freshly pasted scan have an ETA immediately instead of measuring from
+    # scratch. Not persisted; the startup replay refills it.
+    ore_ticks: deque = field(default_factory=deque)
+
+    def note_tick(self, epoch: float, ore: str, units: int):
+        """Record one mining/residue tick for the rolling rate window."""
+        if not epoch:
+            return
+        self.ore_ticks.append((epoch, ore, int(units)))
+        while (self.ore_ticks and
+               epoch - self.ore_ticks[0][0] > RATE_WINDOW_S):
+            self.ore_ticks.popleft()
+
+    def ore_tick_times(self, ore: str) -> list[tuple[float, int]]:
+        """[(epoch, units)] for one ore, oldest first."""
+        return [(ep, u) for ep, o, u in self.ore_ticks if o == ore]
+
+    def mining_ore(self, now_epoch: float | None = None) -> str | None:
+        """The ore this pilot is ticking RIGHT NOW, straight from the log.
+
+        Every mining line names its ore ("You mined 13 units of Zeolites"), so
+        this is read, never inferred.
+        """
+        if not self.ore_ticks:
+            return None
+        now_epoch = now_epoch if now_epoch is not None else time.time()
+        if now_epoch - self.ore_ticks[-1][0] > RATE_IDLE_S:
+            return None
+        return self.ore_ticks[-1][1]
 
     def rock_remaining(self) -> int | None:
         """Units left in the scanned rock, or None when no rock is targeted."""
@@ -405,20 +445,28 @@ class CharacterState:
 
     def rock_depletion_rate(self, now_epoch: float | None = None) -> float:
         """Units per minute coming off the rock (mined + residue); 0 when idle
-        or still warming up."""
-        if not self.rock_events:
+        or still warming up.
+
+        Measured over CYCLES, not log lines, and the first burst's units are
+        deliberately left out of the numerator: they were removed before the
+        window opened. Counting them would inflate the rate by
+        bursts/(bursts-1) - a 50% overshoot at three bursts - which reads as a
+        countdown that is confidently too short.
+        """
+        if not self.target:
+            return 0.0
+        ticks = self.ore_tick_times(self.target.ore)
+        if not ticks:
             return 0.0
         now_epoch = now_epoch if now_epoch is not None else time.time()
-        newest = self.rock_events[-1][0]
-        if now_epoch - newest > RATE_IDLE_S:
+        if now_epoch - ticks[-1][0] > RATE_IDLE_S:
             return 0.0
-        oldest = self.rock_events[0][0]
-        span = newest - oldest
+        bursts = tick_bursts(ticks)
+        span = bursts[-1][0] - bursts[0][0]
         # Below the warm-up threshold the rate is noise, not a number.
-        if len(self.rock_events) < ROCK_WARMUP_TICKS or span < ROCK_WARMUP_S:
+        if len(bursts) < ROCK_WARMUP_BURSTS or span < ROCK_WARMUP_S:
             return 0.0
-        total = sum(u for _, u in self.rock_events)
-        return total / (span / 60.0)
+        return sum(u for _, u in bursts[1:]) / (span / 60.0)
 
     def rock_status(self, now_epoch: float | None = None) -> str:
         """Why there is (or isn't) a rock ETA: 'ready', 'warmup', or 'idle'.
@@ -428,15 +476,35 @@ class CharacterState:
         """
         if not self.target:
             return "idle"
-        if not self.rock_events:
-            return "warmup"
         now_epoch = now_epoch if now_epoch is not None else time.time()
-        if now_epoch - self.rock_events[-1][0] > RATE_IDLE_S:
-            return "idle"
-        span = self.rock_events[-1][0] - self.rock_events[0][0]
-        if len(self.rock_events) < ROCK_WARMUP_TICKS or span < ROCK_WARMUP_S:
+        ticks = self.ore_tick_times(self.target.ore)
+        if not ticks or now_epoch - ticks[-1][0] > RATE_IDLE_S:
+            # Mining something else is not the same as not mining: a tracked
+            # rock nobody is touching would otherwise sit at a frozen count
+            # forever, looking live. Name it so the UI can say so.
+            other = self.mining_ore(now_epoch)
+            return "mismatch" if other else "idle"
+        bursts = tick_bursts(ticks)
+        span = bursts[-1][0] - bursts[0][0]
+        if len(bursts) < ROCK_WARMUP_BURSTS or span < ROCK_WARMUP_S:
             return "warmup"
         return "ready"
+
+    def rock_active(self, now_epoch: float | None = None) -> bool:
+        """Is this rock demonstrably being mined RIGHT NOW?
+
+        True only when a tick naming this rock's own ore landed within
+        RATE_IDLE_S. Every mining line names its ore, so this is evidence read
+        from the log - not an assumption that the ship never moved. A pilot
+        busily mining a DIFFERENT ore is not on this rock and reads False.
+        """
+        if not self.target:
+            return False
+        ticks = self.ore_tick_times(self.target.ore)
+        if not ticks:
+            return False
+        now_epoch = now_epoch if now_epoch is not None else time.time()
+        return now_epoch - ticks[-1][0] <= RATE_IDLE_S
 
     def rock_eta_s(self, now_epoch: float | None = None) -> float | None:
         """Seconds until the scanned rock is dry; None when unknown."""
@@ -475,6 +543,67 @@ class CharacterState:
     @property
     def pct(self) -> float:
         return 100.0 * self.est_m3 / self.capacity if self.capacity else 0.0
+
+
+def tick_bursts(ticks: list[tuple[float, int]]) -> list[tuple[float, int]]:
+    """[(epoch, units)] -> one (burst_start, units_in_burst) entry per cycle.
+
+    Collapses a multi-laser volley (and the residue line trailing it) into the
+    single mining cycle it really is, so a rate is measured per cycle rather
+    than per log line.
+    """
+    bursts: list[tuple[float, int]] = []
+    for ep, units in ticks:
+        if bursts and ep - bursts[-1][0] <= BURST_GAP_S:
+            start, total = bursts[-1]
+            bursts[-1] = (start, total + units)
+        else:
+            bursts.append((ep, units))
+    return bursts
+
+
+# ---------------------------------------------------------------------------
+# Scanned-rock countdown (gauge inner ring)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RockCountdown:
+    """The tracked rock that will run dry first, across all characters."""
+    character: str
+    ore: str
+    remaining: int
+    fraction: float          # units left / units at scan: 1.0 -> 0.0
+    eta_s: float | None      # None while warming up or idle
+
+
+def fastest_rock(chars, now_epoch: float | None = None) -> "RockCountdown | None":
+    """Pick the rock the fleet will exhaust soonest; None when none tracked.
+
+    Ranked by ETA (soonest first) because that is the thing a miner has to
+    react to. Characters with no ETA yet (warm-up or idle) sort last, broken
+    by how little of their rock is left.
+
+    `fraction` is deliberately units-based, not time-based: it is defined the
+    instant a scan is pasted (no warm-up dead zone), and it only ever moves
+    down, because depleted_units only goes up. A time-based ratio would jump
+    backwards every time the rate estimate wobbled. At a steady rate the two
+    are the same curve anyway - units left IS time left.
+    """
+    best = None
+    best_key = None
+    for c in chars:
+        remaining = c.rock_remaining()
+        if not remaining:            # no rock targeted, or already dry
+            continue
+        fraction = min(1.0, remaining / max(1, c.target.scan_units))
+        eta_s = c.rock_eta_s(now_epoch)
+        key = (eta_s if eta_s is not None else float("inf"), fraction)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = RockCountdown(character=c.name, ore=c.target.ore,
+                                 remaining=remaining, fraction=fraction,
+                                 eta_s=eta_s)
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -720,7 +849,10 @@ class Engine:
         c = self.char(character)
         c.target = TargetRock(ore=ore, scan_units=int(units), scan_ts=now_ts(),
                               distance_m=float(distance_m))
-        c.rock_events.clear()
+        # NOTE: ore_ticks is deliberately NOT cleared. The pilot was already
+        # mining when they pasted the scan, and how fast they chew this ore is
+        # measured from that history - so the countdown starts with a real
+        # rate instead of waiting a cycle to rediscover what we already knew.
         log.info("target: %s -> %s %d units @ %.0f m",
                  character, ore, units, distance_m)
         self.save_state()
@@ -730,25 +862,55 @@ class Engine:
         if not c:
             return
         c.target = None
-        c.rock_events.clear()
         self.save_state()
+
+    def abandon_target(self, character: str, reason: str) -> bool:
+        """Drop a tracked rock, saying why. No-op when nothing is tracked.
+
+        Every path that invalidates a rock funnels through here so the reason
+        is always in the log - a countdown that vanishes without explanation
+        looks like a bug.
+        """
+        c = self.chars.get(character)
+        if not c or not c.target:
+            return False
+        log.info("target: %s dropping %s rock (%s)",
+                 character, c.target.ore, reason)
+        self.clear_target(character)
+        return True
 
     def rock_popped(self, character: str):
         """An observed pop (drone stop) outranks arithmetic - spec D4."""
-        c = self.chars.get(character)
-        if c and c.target:
-            log.info("target: %s rock popped (observed)", character)
-            self.clear_target(character)
+        self.abandon_target(character, "popped (observed)")
 
     def left_system(self, character: str):
         """Abandon the tracked rock: asteroids are grid-local, and scanner
         distances are measured from the ship, so a rock scanned in the system
         you just left can never be the one you are mining now."""
-        c = self.chars.get(character)
-        if c and c.target:
-            log.info("target: %s left the system, dropping %s rock",
-                     character, c.target.ore)
-            self.clear_target(character)
+        self.abandon_target(character, "left the system")
+
+    def client_closed(self, character: str) -> bool:
+        """The EVE client went away. Docking, ship swaps and belt changes all
+        happen unobserved while it is shut, so whatever is mined next is not
+        provably this rock - and a countdown nobody is watching keeps ticking
+        down to a "dry" that never happened."""
+        return self.abandon_target(character, "client closed")
+
+    def drop_stale_targets(self, now_epoch: float | None = None) -> list[str]:
+        """Startup sweep: keep only rocks the logs show still being mined.
+
+        The target survives a restart (that is the point of persisting it),
+        but surviving is conditional: after the replay, a rock with no tick of
+        its own ore in the last RATE_IDLE_S is a rock the pilot has already
+        walked away from. Restoring that would show a confident countdown for
+        an asteroid that may not exist any more.
+        """
+        dropped = []
+        for name, c in list(self.chars.items()):
+            if c.target and not c.rock_active(now_epoch):
+                if self.abandon_target(name, "not mining it at startup"):
+                    dropped.append(name)
+        return dropped
 
     def _apply_depletion(self, ev):
         """Count a mining or residue event against the character's rock.
@@ -757,20 +919,20 @@ class Engine:
         calibration newer than the scan cannot silently stop depletion.
         """
         c = self.chars.get(ev.character)
-        if not c or not c.target or ev.ore != c.target.ore:
+        if not c:
+            return
+        # Rate history first, and for EVERY ore: it is how fast this ship
+        # chews rock, which is true whether or not the tick matches the
+        # tracked one - and knowing what else they are mining is what lets a
+        # frozen countdown be reported instead of just sitting there.
+        c.note_tick(ts_to_epoch(ev.ts), ev.ore, ev.qty)
+        if not c.target or ev.ore != c.target.ore:
             return
         if ev.ts <= c.target.scan_ts:   # log timestamps sort lexicographically
             return
         c.target.depleted_units += ev.qty
-        ep = ts_to_epoch(ev.ts)
-        if ep:
-            c.rock_events.append((ep, ev.qty))
-            while (c.rock_events and
-                   ep - c.rock_events[0][0] > RATE_WINDOW_S):
-                c.rock_events.popleft()
         if c.rock_remaining() <= 0:
-            log.info("target: %s rock exhausted by count", ev.character)
-            self.clear_target(ev.character)
+            self.abandon_target(ev.character, "exhausted by count")
 
     def set_capacity(self, name: str, m3: float):
         c = self.char(name)
