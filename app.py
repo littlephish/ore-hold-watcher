@@ -3203,8 +3203,9 @@ class MainWindow(QMainWindow):
                 if now_utc - self._drone_alerted.get(ev.character, 0.0) >= cd:
                     self._drone_alerted[ev.character] = now_utc
                     self._pending_resume.add(ev.character)
+                    what = ev.module or "mining drone(s)"
                     self.request_alert(
-                        f"🛑 {ev.character} - mining drone(s) stopped "
+                        f"🛑 {ev.character} - {what} stopped "
                         f"(asteroid depleted)")
             if isinstance(ev, HoldFullEvent):
                 c = self.engine.char(ev.character)

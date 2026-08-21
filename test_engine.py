@@ -7,7 +7,8 @@ from pathlib import Path
 
 from engine import (CharacterState, Engine, MiningEvent, HoldFullEvent,
                     UnknownOreEvent, OreTable, ResidueEvent, TargetRock,
-                    fastest_rock, tick_bursts, ts_to_epoch)
+                    DroneStopEvent, fastest_rock, tick_bursts,
+                    ts_to_epoch)
 
 HEADER = (
     "------------------------------------------------------------\n"
@@ -250,8 +251,101 @@ def main():
     t2 = e2.char("Yuri Urt").target
     assert t2 is not None, "target did not survive reload"
     assert t2.ore == "Coesite" and t2.scan_units == 5000
-    assert t2.depleted_units == 1200
     approx(t2.distance_m, 726.0)
+    # Only the ANCHOR persists. depleted_units is a running total of replayed
+    # ticks, so restoring it and then replaying the same ticks would count
+    # them twice - it starts at 0 and the replay rebuilds it, exactly like
+    # est_m3 rebuilds from anchor_m3.
+    assert t2.depleted_units == 0, t2.depleted_units
+
+    # --- ice mining: crits and module shut-off ---------------------------------
+    # Verbatim lines from a real ice-mining gamelog (2026.08.21). Both were
+    # invisible to the parser: the crit line matched no mining pattern at all,
+    # and the harvester shut-off only matched when a DRONE said it.
+    icedir = Path(tempfile.mkdtemp())
+    NL = chr(10)
+    BOM = bytes((0xEF, 0xBB, 0xBF))
+    (icedir / "20260821_110533_2119875194.txt").write_bytes(
+        BOM + (HEADER.format(name="Koshii Besmertniy") + NL.join([
+            "[ 2026.08.21 11:12:10 ] (mining) <color=0x77ffffff>You mined "
+            "<font size=12><color=#ff8dc169>1<color=0x77ffffff><font size=10>"
+            " units of <color=0xffffffff><font size=12>White Glaze",
+            "[ 2026.08.21 11:12:10 ] (mining) <color=#fff0ff45>Critical "
+            "mining success!<color=0x77ffffff><font size=10> You mined an "
+            "additional <color=#fff0ff45><font size=12>2<color=0x77ffffff>"
+            "<font size=10> units of <color=0xffffffff><font size=12>"
+            "White Glaze",
+            "[ 2026.08.21 11:20:00 ] (notify) <color=0x77ffffff>ORE Ice "
+            "Harvester deactivates as it finds the resource it was "
+            "harvesting a pale shadow of its former glory.",
+        ]) + NL).encode("utf-8"))
+    eice = Engine(log_dir=icedir, state_path=icedir / "s.json")
+    eice.drone_enabled = True
+    iev = eice.poll()
+    mined = [v for v in iev if isinstance(v, MiningEvent)]
+    assert len(mined) == 2, [type(v).__name__ for v in iev]
+    # the crit is BONUS yield on top of the same cycle's normal tick, so the
+    # units add up rather than replacing each other
+    assert [v.qty for v in mined] == [1, 2], mined
+    assert [v.crit for v in mined] == [False, True], mined
+    assert mined[1].ore == "White Glaze"
+    approx(eice.char("Koshii Besmertniy").est_m3, 3 * 1000.0)   # ice: 1000 m3
+    assert eice.stats["unmatched_mining"] == 0, "crit line must parse"
+    assert eice.stats["crit_events"] == 1 and eice.stats["crit_units"] == 2
+
+    # a module - not just a drone - reports the rock running out, and says
+    # which module it was
+    stops = [v for v in iev if isinstance(v, DroneStopEvent)]
+    assert len(stops) == 1, iev
+    assert stops[0].module == "ORE Ice Harvester", stops[0]
+
+    # --- a crit tick must land in the HOLD, the ROCK and the LEDGER -----------
+    # Three ticks in one second: two harvesters plus the crit that bonuses one
+    # of them. Second-resolution timestamps mean they collide, and nothing may
+    # be lost to that collision.
+    critdir = Path(tempfile.mkdtemp())
+    (critdir / "20260821_110533_2119875194.txt").write_bytes(
+        BOM + (HEADER.format(name="Koshii Besmertniy") + NL.join([
+            "[ 2026.08.21 11:12:10 ] (mining) You mined 1 units of White Glaze",
+            "[ 2026.08.21 11:12:10 ] (mining) Critical mining success! You "
+            "mined an additional 2 units of White Glaze",
+            "[ 2026.08.21 11:12:10 ] (mining) You mined 1 units of White Glaze",
+        ]) + NL).encode("utf-8"))
+    lpath = critdir / "ledger.json"
+
+    def replay_crit():
+        """Fresh Engine over the same file - i.e. what a restart does."""
+        en = Engine(log_dir=critdir, state_path=critdir / "s.json",
+                    ledger_path=lpath, ledger_enabled=True)
+        en.set_target("Koshii Besmertniy", ore="White Glaze", units=100,
+                      distance_m=90.0)
+        # anchor the scan a second before the ticks so they all count
+        en.chars["Koshii Besmertniy"].target.scan_ts = "2026.08.21 11:12:00"
+        en.poll()
+        en.save_ledger()
+        return en
+
+    def banked(en):
+        return sum(sum(o.values())
+                   for d in en.ledger["days"].values() for o in d.values())
+
+    en = replay_crit()
+    cc = en.chars["Koshii Besmertniy"]
+    approx(cc.est_m3, 4 * 1000.0)           # HOLD: 1 + 2 crit + 1, ice 1000 m3
+    assert cc.target.depleted_units == 4    # ROCK: the bonus came off the rock
+    assert cc.rock_remaining() == 96
+    assert banked(en) == 4, banked(en)      # LEDGER: every tick in the second
+    # a restart re-reads the file from byte 0: the count must not drift
+    assert banked(replay_crit()) == 4
+    assert banked(replay_crit()) == 4
+
+    # a legacy ledger (marks, no mark_counts) banked exactly one tick for that
+    # second - it must resume from there rather than re-banking it
+    import json as _json
+    _json.dump({"days": {"2026.08.21": {"Koshii Besmertniy": {"White Glaze": 1}}},
+                "marks": {"Koshii Besmertniy": "2026.08.21 11:12:10"}},
+               open(lpath, "w", encoding="utf-8"))
+    assert banked(replay_crit()) == 4, "legacy mark must top up, not double"
 
     # --- rate measurement: cycles, not log lines -------------------------------
     # A three-laser volley plus its residue line is ONE cycle. Counting the
@@ -346,6 +440,102 @@ def main():
     assert e4.char("Yuri Urt").target is None
     assert e4.client_closed("Yuri Urt") is False
     assert e4.client_closed("Nobody At All") is False
+
+    # --- ledger position: (filename, line number), not a timestamp -----------
+    posdir = Path(tempfile.mkdtemp())
+    pname = "20260821_120000_96372005.txt"
+    body = [
+        "[ 2026.08.21 12:00:00 ] (mining) You mined 10 units of Zeolites",
+        "[ 2026.08.21 12:00:00 ] (mining) You mined 10 units of Zeolites",
+        "[ 2026.08.21 12:00:00 ] (mining) Critical mining success! You mined "
+        "an additional 5 units of Zeolites",
+        "[ 2026.08.21 12:01:00 ] (mining) You mined 10 units of Zeolites",
+    ]
+    (posdir / pname).write_bytes(
+        BOM + (HEADER.format(name="Yuri Urt") + NL.join(body)
+               + NL).encode("utf-8"))
+    plp = posdir / "ledger.json"
+
+    def pos_run():
+        en = Engine(log_dir=posdir, state_path=posdir / "s.json",
+                    ledger_path=plp, ledger_enabled=True)
+        en.poll()
+        en.save_ledger()
+        return en
+
+    def pos_banked(en):
+        return sum(sum(o.values())
+                   for d in en.ledger["days"].values() for o in d.values())
+
+    ep = pos_run()
+    assert pos_banked(ep) == 35, pos_banked(ep)     # 10 + 10 + 5 crit + 10
+    # the position is the file and the last banked LINE, not a timestamp
+    entry = ep.ledger["reads"][pname]
+    assert entry["lines"] == 5 + 4, entry           # 5 header lines + 4 ticks
+    assert entry["bytes"] > 0
+    # replay banks nothing further, however many times
+    assert pos_banked(pos_run()) == 35
+    assert pos_banked(pos_run()) == 35
+
+    # appending is picked up from the stored position
+    with open(posdir / pname, "ab") as fh:
+        fh.write(("[ 2026.08.21 12:02:00 ] (mining) You mined 7 units of "
+                  "Zeolites" + NL).encode("utf-8"))
+    assert pos_banked(pos_run()) == 42
+
+    # a shrunken file cannot be the one we recorded a position in: drop it and
+    # re-read rather than silently skipping real mining
+    ep = pos_run()
+    ep.ledger["reads"][pname]["bytes"] = 10 ** 9
+    ep.save_ledger()
+    ep2 = pos_run()
+    assert pname in ep2.ledger["reads"]
+    assert ep2.ledger["reads"][pname]["bytes"] < 10 ** 9, "truncation not seen"
+
+    # positions for gamelogs that no longer exist are forgotten, so the dict
+    # cannot grow one entry per session forever
+    ep2.ledger["reads"]["20200101_000000_1.txt"] = {"lines": 5, "bytes": 5}
+    ep2.save_ledger()
+    assert "20200101_000000_1.txt" not in pos_run().ledger["reads"]
+    # ...but an unreadable/empty folder must never drop anything: wrongly
+    # forgetting a position re-banks a whole file
+    empty = Engine(log_dir=posdir / "gone", state_path=posdir / "s2.json",
+                   ledger_path=plp, ledger_enabled=True)
+    assert pname in empty.ledger["reads"]
+
+    # --- replay is idempotent for the ROCK, not just the hold ----------------
+    # est_m3 has always rebuilt itself from the anchor, so restarts never
+    # drifted it. depleted_units used to be persisted AND re-accrued by the
+    # replay, so every restart (and every Recalculate) chewed the rock twice
+    # as fast - it could even vanish as "exhausted by count" while the pilot
+    # was still mining it.
+    rep = Path(tempfile.mkdtemp())
+    (rep / "20260821_110000_96372005.txt").write_bytes(
+        BOM + (HEADER.format(name="Yuri Urt") + NL.join(
+            "[ 2026.08.21 11:%02d:00 ] (mining) You mined 100 units of Zeolites"
+            % i for i in range(10, 20)) + NL).encode("utf-8"))
+    rsp = rep / "s.json"
+    er = Engine(log_dir=rep, state_path=rsp)
+    er.poll()
+    er.set_target("Yuri Urt", ore="Zeolites", units=5000, distance_m=90.0)
+    er.chars["Yuri Urt"].target.scan_ts = "2026.08.21 11:09:00"
+    er.save_state()
+
+    for attempt in range(3):            # three cold starts over the same log
+        er = Engine(log_dir=rep, state_path=rsp)
+        er.poll()
+        rc = er.chars["Yuri Urt"]
+        approx(rc.est_m3, 10 * 100 * 10.0)          # hold: 10 ticks x 100 x 10
+        assert rc.target.depleted_units == 1000, (attempt,
+                                                  rc.target.depleted_units)
+        assert rc.rock_remaining() == 4000
+        er.save_state()
+
+    # Recalculate replays from byte 0 inside a live session - same rule
+    er.recalculate()
+    rc = er.chars["Yuri Urt"]
+    approx(rc.est_m3, 10 * 100 * 10.0)
+    assert rc.target.depleted_units == 1000, rc.target.depleted_units
 
     # a state file with no target key loads cleanly (backward compatible)
     legacy = tmp / "state_legacy.json"

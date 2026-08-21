@@ -54,8 +54,10 @@ _NUM = r"[\d][\d,.  '\s]*"
 # Tried in order against the tag-stripped message of (mining)/(notify)/(info)
 # channel lines. Must expose named groups 'qty' and 'ore'.
 DEFAULT_MINING_PATTERNS = [
-    # "You have successfully mined 1,244 units of Veldspar" (and variants)
-    rf"You\s+(?:have\s+)?(?:successfully\s+)?min(?:ed|e)\s+(?P<qty>{_NUM})\s+units?\s+of\s+(?P<ore>.+?)\s*[.!]*\s*$",
+    # "You have successfully mined 1,244 units of Veldspar" (and variants).
+    # "an additional" catches the critical-mining-success bonus line, which
+    # is otherwise identical - see CRIT_RE.
+    rf"You\s+(?:have\s+)?(?:successfully\s+)?min(?:ed|e)\s+(?:an\s+additional\s+)?(?P<qty>{_NUM})\s+units?\s+of\s+(?P<ore>.+?)\s*[.!]*\s*$",
     # "Your mining laser/harvester ... extracted 1,244 units of Blue Ice"
     rf"(?:extract(?:ed|s)|harvest(?:ed|s)|acquir(?:ed|es))\s+(?P<qty>{_NUM})\s+units?\s+of\s+(?P<ore>.+?)\s*[.!]*\s*$",
     # "1,244 units of Veldspar was mined / transferred to your ore hold"
@@ -63,6 +65,16 @@ DEFAULT_MINING_PATTERNS = [
 ]
 
 MINING_CHANNELS = {"mining", "notify", "info"}
+
+# "(mining) Critical mining success! You mined an additional 2 units of
+#  White Glaze" - verified in a real gamelog (ice, 2026.08.21).
+#
+# This is BONUS yield on top of the cycle's normal tick, and that normal tick
+# is logged as its own line at the same timestamp. So the crit line is extra
+# units, never a restatement of the tick - it must be counted, or the hold
+# estimate silently runs low. Flagged rather than merely counted so crits can
+# be reported: nothing else in the log says the ship rolled well.
+CRIT_RE = re.compile(r"critical\s+mining\s+success", re.IGNORECASE)
 
 # "(mining) Additional 13 units depleted from asteroid as residue"
 # Verified in real gamelogs. These units leave the ASTEROID but never enter
@@ -141,10 +153,18 @@ HOLD_FULL_MARKERS = (
 EXCLUDE_MARKERS = ("residue", "wasted", "lost")
 
 # "(notify) Mining Drone I deactivates as it finds the resource it was
-# harvesting a pale shadow of its former glory."  Verified in real logs:
-# a mining drone auto-returned because its asteroid depleted.
+# harvesting a pale shadow of its former glory."  Verified in real logs: the
+# harvester shut off because its rock ran out.
+#
+# The sentence is NOT drone-specific - an ORE Ice Harvester emits it verbatim
+# (2026.08.21 sample), and so do strip miners. Matching on "Mining Drone" made
+# this invisible to every ice and barge pilot, who are exactly the people with
+# a rock worth tracking. Match the sentence and capture whatever said it: this
+# is the only OBSERVED rock-pop signal in the log, and an observed pop
+# outranks arithmetic (spec D4).
 DRONE_STOP_RE = re.compile(
-    r"Mining Drone.*deactivates as it finds the resource", re.IGNORECASE)
+    r"^(?P<module>.+?)\s+deactivates as it finds the resource",
+    re.IGNORECASE)
 
 # --- combat (being attacked) ---
 # Incoming damage after tag-strip: "287 from Attacker - Smashes"
@@ -175,6 +195,7 @@ class MiningEvent:
     ore: str
     m3: float
     ts: str
+    crit: bool = False       # critical mining success: bonus units, see CRIT_RE
 
 
 @dataclass
@@ -194,6 +215,7 @@ class UnknownOreEvent:
 class DroneStopEvent:
     character: str
     ts: str
+    module: str = ""         # what shut off: "Mining Drone I", "ORE Ice Harvester"
 
 
 @dataclass
@@ -329,6 +351,12 @@ class LogFile:
         self.character: str | None = None
         self.remainder = ""
         self.header_scanned = False
+        # Absolute line numbering from byte 0. Replay re-reads the same
+        # append-only file in the same order, so line N is always line N -
+        # a real identity for a log line, unlike its text or its
+        # second-resolution timestamp.
+        self.lines_seen = 0      # complete lines returned so far this run
+        self.first_line_no = 0   # index of lines[0] from the latest read
 
     def _detect_encoding(self, head: bytes) -> str:
         if head.startswith(b"\xff\xfe"):
@@ -363,6 +391,8 @@ class LogFile:
         lines = text.split("\n")
         self.remainder = lines.pop()  # possibly-partial last line
         out = [ln.rstrip("\r").lstrip("﻿") for ln in lines]
+        self.first_line_no = self.lines_seen
+        self.lines_seen += len(out)
         if not self.header_scanned:
             for ln in out:
                 m = LISTENER_RE.search(ln)
@@ -647,7 +677,11 @@ class Engine:
         # activity: day -> char -> state -> seconds spent in that state
         #         (mining / idle / full / offline). Forward-accumulated from
         #         live ticks by the GUI; not derived from logs on replay.
-        self.ledger = {"marks": {}, "days": {}, "prices": {}, "activity": {}}
+        self.ledger = {"marks": {}, "mark_counts": {}, "reads": {},
+                       "days": {}, "prices": {}, "activity": {}}
+        # per-run, per-character (ts, ticks seen in that second) - see
+        # _tick_ordinal
+        self._seen_at: dict[str, tuple[str, int]] = {}
         self._load_ledger()
         self._sde_paths = list(sde_paths or [])
         self.table = OreTable(ore_override_path, self._sde_paths)
@@ -700,7 +734,10 @@ class Engine:
                     scan_units=int(td.get("scan_units", 0)),
                     scan_ts=str(td.get("scan_ts", "")),
                     distance_m=float(td.get("distance_m", 0.0)),
-                    depleted_units=int(td.get("depleted_units", 0)),
+                    # always 0: the replay below rebuilds it (see save_state).
+                    # Older state files carry a depleted_units key; ignoring
+                    # it is what makes the restart idempotent.
+                    depleted_units=0,
                 )
 
     def save_state(self):
@@ -710,11 +747,16 @@ class Engine:
                  "notified": c.notified, "anchor_ts": c.anchor_ts,
                  "anchor_m3": c.anchor_m3}
             if c.target:
+                # Only the ANCHOR is persisted, exactly like anchor_ts /
+                # anchor_m3 for the hold. depleted_units is a running total of
+                # replayed ticks, so writing it down and then replaying the
+                # same ticks on the next start counts them twice - the rock
+                # reads half-empty and can even vanish as "exhausted". It is
+                # recomputed from scan_ts on every startup instead.
                 d["target"] = {"ore": c.target.ore,
                                "scan_units": c.target.scan_units,
                                "scan_ts": c.target.scan_ts,
-                               "distance_m": c.target.distance_m,
-                               "depleted_units": c.target.depleted_units}
+                               "distance_m": c.target.distance_m}
             chars[c.name] = d
         data = {"characters": chars}
         try:
@@ -731,11 +773,36 @@ class Engine:
             data = json.loads(self.ledger_path.read_text(encoding="utf-8"))
             if isinstance(data.get("days"), dict):
                 self.ledger = {"marks": dict(data.get("marks", {})),
+                               "mark_counts": dict(data.get("mark_counts", {})),
+                               "reads": dict(data.get("reads", {})),
                                "days": data["days"],
                                "prices": dict(data.get("prices", {})),
                                "activity": dict(data.get("activity", {}))}
         except Exception as e:
             log.warning("ledger load failed: %s", e)
+        self._prune_reads()
+
+    def _prune_reads(self):
+        """Forget read positions for gamelogs that no longer exist.
+
+        Bounded growth: EVE writes one file per client session and never
+        deletes them, so this dict would otherwise accumulate an entry per
+        session forever. Deliberately conservative - if the folder cannot be
+        listed, or lists empty, nothing is dropped. Wrongly dropping an entry
+        re-banks a whole file, so "do nothing" is always the safer failure.
+        """
+        reads = self.ledger.get("reads")
+        if not reads:
+            return
+        try:
+            present = {p.name for p in self.log_dir.iterdir()
+                       if p.suffix.lower() == ".txt"}
+        except OSError:
+            return
+        if not present:
+            return
+        for gone in [k for k in reads if k not in present]:
+            reads.pop(gone, None)
 
     def snapshot_prices(self, day: str, price_map: dict) -> bool:
         """Freeze the given day's ISK price basis. Overwrites only the day
@@ -770,16 +837,71 @@ class Engine:
         except OSError as e:
             log.warning("ledger save failed: %s", e)
 
-    def _ledger_add(self, ev: MiningEvent) -> bool:
-        mark = self.ledger["marks"].get(ev.character, "")
-        if mark and ev.ts <= mark:
-            return False                # already counted (replay)
+    def _ledger_add(self, ev: MiningEvent, fname: str, line_no: int) -> bool:
+        """Accrue one tick into the daily ledger, exactly once ever.
+
+        The ledger is the only consumer that cannot rebuild itself: it
+        accumulates across days, and its source lines eventually age out of
+        the lookback window. So unlike est_m3 and depleted_units - which are
+        thrown away and recomputed from an anchor on every start - it has to
+        remember its own position and resume.
+
+        That position is (gamelog filename, line number). It is the identity
+        the reader already uses, and it is exact: EVE writes one append-only
+        file per client session and never rotates or truncates one, so line N
+        of a file is always line N.
+
+        Timestamps cannot do this job. They are second-resolution, and a
+        mining second is rarely one tick - every laser reports separately and
+        a critical success always shares the second of the tick it bonuses.
+        The old "ts <= mark" test threw away every tick after the first in
+        each second: 45% of a real ice-mining session, and 100% of its crits.
+        """
+        ordinal = self._tick_ordinal(ev)
+        reads = self.ledger["reads"]
+        pos = reads.get(fname)
+        if pos is not None:
+            if line_no < int(pos.get("lines", 0)):
+                return False        # this exact line is already banked
+        elif self._legacy_banked(ev, ordinal):
+            # Upgrade path: this file predates per-file positions, so fall
+            # back to the old per-character timestamp mark to decide. From
+            # here on the file gets a real position and never needs it again.
+            return False
         day = ev.ts[:10]                # "YYYY.MM.DD" (UTC == EVE time)
         per_char = self.ledger["days"].setdefault(day, {})
         ores_d = per_char.setdefault(ev.character, {})
         ores_d[ev.ore] = ores_d.get(ev.ore, 0) + ev.qty
+        entry = reads.setdefault(fname, {"lines": 0, "bytes": 0})
+        entry["lines"] = line_no + 1
+        # Keep the old marks current too, so rolling the build back (this ships
+        # as a folder swap) resumes correctly instead of re-banking the day.
         self.ledger["marks"][ev.character] = ev.ts
+        self.ledger["mark_counts"][ev.character] = ordinal
         return True
+
+    def _tick_ordinal(self, ev: MiningEvent) -> int:
+        """1-based index of this tick among that character's ticks in its
+        second. Counted for EVERY tick, banked or skipped, so it stays aligned
+        with what a replay sees."""
+        last_ts, n = self._seen_at.get(ev.character, ("", 0))
+        n = n + 1 if last_ts == ev.ts else 1
+        self._seen_at[ev.character] = (ev.ts, n)
+        return n
+
+    def _legacy_banked(self, ev: MiningEvent, ordinal: int) -> bool:
+        """Pre-position ledgers marked progress as (timestamp, ticks banked in
+        that second). Only consulted for files with no recorded position."""
+        mark = self.ledger["marks"].get(ev.character, "")
+        if not mark:
+            return False
+        if ev.ts < mark:
+            return True
+        if ev.ts == mark:
+            # ledgers written before mark_counts existed banked exactly one
+            # tick for the mark second, so assume 1
+            return ordinal <= self.ledger["mark_counts"].get(ev.character, 1)
+        return False
 
     def activity_add(self, character: str, state: str, seconds: float,
                      day: str | None = None) -> bool:
@@ -828,6 +950,9 @@ class Engine:
             c.notified = False
             c.rate_events.clear()  # replay refills these; keeping them would
                                    # double-count the rate and wreck the ETA
+            c.ore_ticks.clear()    # same for the per-ore rock rate history
+            if c.target:           # and for the rock's own depletion total
+                c.target.depleted_units = 0
         self.files.clear()      # forget offsets -> re-read from byte 0
         self._last_scan = 0.0   # force immediate rediscovery
         self.save_state()
@@ -990,8 +1115,12 @@ class Engine:
             if not lines:
                 continue
             self.stats["lines"] += len(lines)
+            fname = lf.path.name
+            if lf.first_line_no == 0:
+                self._check_truncated(fname, lf.offset)
             name = lf.character or lf.path.stem
-            for ln in lines:
+            for i, ln in enumerate(lines):
+                line_no = lf.first_line_no + i
                 ev = self._parse_line(name, ln)
                 if ev is None:
                     continue
@@ -1025,7 +1154,8 @@ class Engine:
                     self.stats["mining_events"] += 1
                     log.debug("mining: %s +%d %s = %.1f m3",
                               ev.character, ev.qty, ev.ore, ev.m3)
-                    if self.ledger_enabled and self._ledger_add(ev):
+                    if (self.ledger_enabled and
+                            self._ledger_add(ev, fname, line_no)):
                         ledger_dirty = True
                     c = self.char(ev.character)
                     c.est_m3 += ev.m3
@@ -1059,11 +1189,34 @@ class Engine:
                     self.stats["residue_events"] = (
                         self.stats.get("residue_events", 0) + 1)
                     # NOTE: no est_m3 change - residue never enters the hold.
+            entry = self.ledger.get("reads", {}).get(fname)
+            if entry is not None:
+                # The gate is the line number; the byte offset rides along as
+                # the truncation sentinel and as a human-readable "how far did
+                # we get" when reading ledger.json by hand.
+                entry["bytes"] = lf.offset
         if dirty:
             self.save_state()
         if ledger_dirty:
             self.save_ledger()
         return events
+
+    def _check_truncated(self, fname: str, size: int):
+        """A gamelog that shrank is not the file we recorded a position in.
+
+        EVE never rewrites or rotates a gamelog, so this should never fire -
+        but a stale position on replaced content would silently skip real
+        mining, which is worse than re-banking it.
+        """
+        entry = self.ledger.get("reads", {}).get(fname)
+        if entry and size < int(entry.get("bytes", 0)):
+            log.warning("gamelog %s shrank (%d < %d) - re-reading it",
+                        fname, size, entry.get("bytes", 0))
+            # Rewound, NOT removed: an absent position falls back to the old
+            # per-character timestamp mark, which would skip the replacement
+            # content instead of reading it.
+            entry["lines"] = 0
+            entry["bytes"] = 0
 
     def _parse_line(self, character: str, line: str):
         m = LINE_RE.match(line)
@@ -1085,9 +1238,11 @@ class Engine:
         low = msg.lower()
         if channel == "notify" and any(k in low for k in HOLD_FULL_MARKERS):
             return HoldFullEvent(character=character, ts=m.group("ts"))
-        if (channel == "notify" and self.drone_enabled and
-                DRONE_STOP_RE.search(msg)):
-            return DroneStopEvent(character=character, ts=m.group("ts"))
+        if channel == "notify" and self.drone_enabled:
+            dm = DRONE_STOP_RE.search(msg)
+            if dm:
+                return DroneStopEvent(character=character, ts=m.group("ts"),
+                                      module=dm.group("module").strip())
         cm = COMPRESS_RE.search(msg)
         if cm:
             qty = parse_qty(cm.group("qty"))
@@ -1134,8 +1289,12 @@ class Engine:
                 log.warning("unknown ore '%s' (qty %d) from %s", ore, qty, character)
                 return UnknownOreEvent(character=character, ore=ore, qty=qty)
             self._last_tick[character] = (m.group("ts"), ore)
+            crit = bool(CRIT_RE.search(msg))
+            if crit:
+                self.stats["crit_events"] = self.stats.get("crit_events", 0) + 1
+                self.stats["crit_units"] = self.stats.get("crit_units", 0) + qty
             return MiningEvent(character=character, qty=qty, ore=ore,
-                               m3=qty * vol, ts=m.group("ts"))
+                               m3=qty * vol, ts=m.group("ts"), crit=crit)
         if channel == "mining":
             # a (mining) line none of our patterns matched - the one thing
             # we most need to see when diagnosing "nothing is changing"
