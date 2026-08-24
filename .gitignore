@@ -1,9 +1,10 @@
-# runtime config/state (lives beside the exe — user-specific, don't commit)
+# runtime config/state (user-specific, don't commit)
 settings.json
 state.json
 ores_override.json
 ledger.json
 prices.json
+sde_volumes.json
 debug.log
 debug.log.*
 .write_test
@@ -15,8 +16,16 @@ __pycache__/
 
 # build output
 build/
+dist/
 *.exe
 
+# rust updater build output
+updater/target/
+
 # auto-update leftovers
+update/
+update-log.txt
 *.exe.new
 *.update.bat
+.superpowers/
+*.sample

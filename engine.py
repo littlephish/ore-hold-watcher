@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LittlePhish
 """Log-watching / ore-hold-estimation engine for Ore Hold Watcher.
 
 Pure Python (no Qt) so it can be unit-tested headless. The GUI drives it by
@@ -43,6 +45,7 @@ LINE_RE = re.compile(
 LISTENER_RE = re.compile(r"Listener:\s*(?P<name>.+?)\s*$")
 
 TAG_RE = re.compile(r"<[^>]+>")  # strip <color=...>, <b>, etc.
+GRADE_SUFFIX_RE = re.compile(r"\s+[ivx]+-grade$", re.IGNORECASE)
 
 # Number like 1,244 or 1 244 or 1'244 or 1244
 _NUM = r"[\d][\d,.  '\s]*"
@@ -51,8 +54,10 @@ _NUM = r"[\d][\d,.  '\s]*"
 # Tried in order against the tag-stripped message of (mining)/(notify)/(info)
 # channel lines. Must expose named groups 'qty' and 'ore'.
 DEFAULT_MINING_PATTERNS = [
-    # "You have successfully mined 1,244 units of Veldspar" (and variants)
-    rf"You\s+(?:have\s+)?(?:successfully\s+)?min(?:ed|e)\s+(?P<qty>{_NUM})\s+units?\s+of\s+(?P<ore>.+?)\s*[.!]*\s*$",
+    # "You have successfully mined 1,244 units of Veldspar" (and variants).
+    # "an additional" catches the critical-mining-success bonus line, which
+    # is otherwise identical - see CRIT_RE.
+    rf"You\s+(?:have\s+)?(?:successfully\s+)?min(?:ed|e)\s+(?:an\s+additional\s+)?(?P<qty>{_NUM})\s+units?\s+of\s+(?P<ore>.+?)\s*[.!]*\s*$",
     # "Your mining laser/harvester ... extracted 1,244 units of Blue Ice"
     rf"(?:extract(?:ed|s)|harvest(?:ed|s)|acquir(?:ed|es))\s+(?P<qty>{_NUM})\s+units?\s+of\s+(?P<ore>.+?)\s*[.!]*\s*$",
     # "1,244 units of Veldspar was mined / transferred to your ore hold"
@@ -60,6 +65,39 @@ DEFAULT_MINING_PATTERNS = [
 ]
 
 MINING_CHANNELS = {"mining", "notify", "info"}
+
+# "(mining) Critical mining success! You mined an additional 2 units of
+#  White Glaze" - verified in a real gamelog (ice, 2026.08.21).
+#
+# This is BONUS yield on top of the cycle's normal tick, and that normal tick
+# is logged as its own line at the same timestamp. So the crit line is extra
+# units, never a restatement of the tick - it must be counted, or the hold
+# estimate silently runs low. Flagged rather than merely counted so crits can
+# be reported: nothing else in the log says the ship rolled well.
+CRIT_RE = re.compile(r"critical\s+mining\s+success", re.IGNORECASE)
+
+# "(mining) Additional 13 units depleted from asteroid as residue"
+# Verified in real gamelogs. These units leave the ASTEROID but never enter
+# the ore hold, so they must not touch est_m3 - but they do count against a
+# scanned rock. The line carries no ore name; it is paired to the character's
+# most recent mining tick (see RESIDUE_PAIR_S).
+RESIDUE_RE = re.compile(
+    rf"Additional\s+(?P<qty>{_NUM})\s+units?\s+depleted\s+from\s+asteroid",
+    re.IGNORECASE,
+)
+
+# Max gap between a mining tick and the residue line belonging to it. In real
+# logs the pair lands within the same timestamp second.
+RESIDUE_PAIR_S = 2.0
+
+# "[ ts ] (None) Jumping from AK-LNZ to NV-ZHM" - verified in real gamelogs.
+# Note the channel is "None", not a mining channel, so this is matched before
+# the MINING_CHANNELS filter. A gate jump always changes system, and asteroids
+# are grid-local, so it always invalidates a tracked rock.
+SYSTEM_CHANGE_RE = re.compile(
+    r"Jumping from\s+(?P<from_sys>.+?)\s+to\s+(?P<to_sys>.+?)\s*$",
+    re.IGNORECASE,
+)
 
 # "(notify) Successfully compressed Glistening Zeolites into 794 Compressed
 #  Glistening Zeolites."  Compression is 1:1 by units (verified against real
@@ -88,6 +126,21 @@ def ts_to_epoch(ts: str) -> float:
 RATE_WINDOW_S = 600   # mining rate = volume over the last 10 minutes
 RATE_IDLE_S = 300     # no cycle for 5 min -> treat as not mining (no ETA)
 
+# Ticks arrive in BURSTS, not one at a time: several lasers on one ship land
+# within a few seconds of each other, and a residue line lands within 2 s of
+# the tick it belongs to. Anything closer together than this is the same
+# cycle, so counting raw lines badly overstates how much evidence we have.
+# Measured against real logs: 3-laser bursts land inside ~3 s, cycles repeat
+# every 30-60 s.
+BURST_GAP_S = 10.0
+
+# A rock rate needs one full cycle between bursts before it means anything -
+# the residue share varies by crystal and ship, so it is measured, never
+# assumed. The span floor only rejects gaps too short to be a real cycle;
+# two lasers firing 2 s apart must never read as 780 units/min.
+ROCK_WARMUP_BURSTS = 2
+ROCK_WARMUP_S = 30.0
+
 
 HOLD_FULL_MARKERS = (
     "ore hold is full",
@@ -100,10 +153,18 @@ HOLD_FULL_MARKERS = (
 EXCLUDE_MARKERS = ("residue", "wasted", "lost")
 
 # "(notify) Mining Drone I deactivates as it finds the resource it was
-# harvesting a pale shadow of its former glory."  Verified in real logs:
-# a mining drone auto-returned because its asteroid depleted.
+# harvesting a pale shadow of its former glory."  Verified in real logs: the
+# harvester shut off because its rock ran out.
+#
+# The sentence is NOT drone-specific - an ORE Ice Harvester emits it verbatim
+# (2026.08.21 sample), and so do strip miners. Matching on "Mining Drone" made
+# this invisible to every ice and barge pilot, who are exactly the people with
+# a rock worth tracking. Match the sentence and capture whatever said it: this
+# is the only OBSERVED rock-pop signal in the log, and an observed pop
+# outranks arithmetic (spec D4).
 DRONE_STOP_RE = re.compile(
-    r"Mining Drone.*deactivates as it finds the resource", re.IGNORECASE)
+    r"^(?P<module>.+?)\s+deactivates as it finds the resource",
+    re.IGNORECASE)
 
 # --- combat (being attacked) ---
 # Incoming damage after tag-strip: "287 from Attacker - Smashes"
@@ -134,6 +195,7 @@ class MiningEvent:
     ore: str
     m3: float
     ts: str
+    crit: bool = False       # critical mining success: bonus units, see CRIT_RE
 
 
 @dataclass
@@ -153,6 +215,7 @@ class UnknownOreEvent:
 class DroneStopEvent:
     character: str
     ts: str
+    module: str = ""         # what shut off: "Mining Drone I", "ORE Ice Harvester"
 
 
 @dataclass
@@ -173,21 +236,65 @@ class CompressionEvent:
     ts: str
 
 
+@dataclass
+class ResidueEvent:
+    character: str
+    qty: int          # units removed from the asteroid, NOT added to the hold
+    ore: str          # inferred from the preceding mining tick
+    ts: str
+
+
+@dataclass
+class SystemChangeEvent:
+    character: str
+    to_system: str
+    ts: str
+
+
+@dataclass
+class TargetRock:
+    """The asteroid a pilot is currently mining, from a survey-scan paste.
+
+    Anchored exactly like CharacterState.anchor_ts/anchor_m3: scan_ts is the
+    moment the snapshot was taken, and only ticks newer than it count against
+    it, so replaying the logs on restart cannot double-count.
+    """
+    ore: str
+    scan_units: int
+    scan_ts: str             # log format "YYYY.MM.DD HH:MM:SS", UTC
+    distance_m: float
+    depleted_units: int = 0  # mined + residue since scan_ts
+
+
 # ---------------------------------------------------------------------------
 # Ore volume lookup
 # ---------------------------------------------------------------------------
 
 class OreTable:
-    def __init__(self, override_path: Path | None = None):
+    def __init__(self, override_path: Path | None = None,
+                 sde_paths: list[Path] | None = None):
         self.base = {k.lower(): v for k, v in ores.ORE_VOLUMES.items()}
         self.compressed = {k.lower(): v for k, v in ores.COMPRESSED_VOLUMES.items()}
         self.overrides: dict[str, float] = {}
+        self.sde: dict[str, float] = {}
         if override_path and override_path.exists():
             try:
                 data = json.loads(override_path.read_text(encoding="utf-8"))
                 self.overrides = {str(k).lower(): float(v) for k, v in data.items()}
             except Exception:
                 pass  # a broken override file should never kill the app
+        self.load_sde(sde_paths or [])
+
+    def load_sde(self, paths: list[Path] | None) -> None:
+        """Load SDE catalogs in priority order, ignoring broken files."""
+        self.sde = {}
+        for path in paths or []:
+            try:
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+                for name, volume in data.items():
+                    self.sde.setdefault(str(name).lower(), float(volume))
+            except (OSError, TypeError, ValueError):
+                continue
 
     def unit_volume(self, name: str) -> float | None:
         n = " ".join(name.split()).strip().strip(".*").lower()
@@ -195,8 +302,19 @@ class OreTable:
             return None
         if n in self.overrides:
             return self.overrides[n]
+        if n in self.sde:
+            return self.sde[n]
         if n in self.base:
             return self.base[n]
+        graded = GRADE_SUFFIX_RE.sub("", n)
+        if graded != n:
+            n = graded
+            if n in self.overrides:
+                return self.overrides[n]
+            if n in self.sde:
+                return self.sde[n]
+            if n in self.base:
+                return self.base[n]
         for prefix in ("batch compressed ", "compressed "):
             if n.startswith(prefix):
                 rest = n[len(prefix):]
@@ -207,7 +325,8 @@ class OreTable:
                 if base is not None:
                     return base / 100.0
                 return None
-        return self._suffix_lookup(n, self.base)
+        volume = self._suffix_lookup(n, self.sde)
+        return volume if volume is not None else self._suffix_lookup(n, self.base)
 
     @staticmethod
     def _suffix_lookup(n: str, table: dict[str, float]) -> float | None:
@@ -232,6 +351,12 @@ class LogFile:
         self.character: str | None = None
         self.remainder = ""
         self.header_scanned = False
+        # Absolute line numbering from byte 0. Replay re-reads the same
+        # append-only file in the same order, so line N is always line N -
+        # a real identity for a log line, unlike its text or its
+        # second-resolution timestamp.
+        self.lines_seen = 0      # complete lines returned so far this run
+        self.first_line_no = 0   # index of lines[0] from the latest read
 
     def _detect_encoding(self, head: bytes) -> str:
         if head.startswith(b"\xff\xfe"):
@@ -266,6 +391,8 @@ class LogFile:
         lines = text.split("\n")
         self.remainder = lines.pop()  # possibly-partial last line
         out = [ln.rstrip("\r").lstrip("﻿") for ln in lines]
+        self.first_line_no = self.lines_seen
+        self.lines_seen += len(out)
         if not self.header_scanned:
             for ln in out:
                 m = LISTENER_RE.search(ln)
@@ -305,6 +432,119 @@ class CharacterState:
     # logs can't fire it; a recent live mining tick arms it (False), going
     # idle fires once and disarms again until mining resumes
     idle_notified: bool = True
+    # scanned-rock countdown (see TargetRock); persisted via save_state
+    target: "TargetRock | None" = None
+    # rolling (epoch, ore, units) for EVERY ore this pilot ticked - mined AND
+    # residue. Rate history is a property of the ship, not of the rock, so it
+    # is kept per ore and independent of any scan anchor: that is what lets a
+    # freshly pasted scan have an ETA immediately instead of measuring from
+    # scratch. Not persisted; the startup replay refills it.
+    ore_ticks: deque = field(default_factory=deque)
+
+    def note_tick(self, epoch: float, ore: str, units: int):
+        """Record one mining/residue tick for the rolling rate window."""
+        if not epoch:
+            return
+        self.ore_ticks.append((epoch, ore, int(units)))
+        while (self.ore_ticks and
+               epoch - self.ore_ticks[0][0] > RATE_WINDOW_S):
+            self.ore_ticks.popleft()
+
+    def ore_tick_times(self, ore: str) -> list[tuple[float, int]]:
+        """[(epoch, units)] for one ore, oldest first."""
+        return [(ep, u) for ep, o, u in self.ore_ticks if o == ore]
+
+    def mining_ore(self, now_epoch: float | None = None) -> str | None:
+        """The ore this pilot is ticking RIGHT NOW, straight from the log.
+
+        Every mining line names its ore ("You mined 13 units of Zeolites"), so
+        this is read, never inferred.
+        """
+        if not self.ore_ticks:
+            return None
+        now_epoch = now_epoch if now_epoch is not None else time.time()
+        if now_epoch - self.ore_ticks[-1][0] > RATE_IDLE_S:
+            return None
+        return self.ore_ticks[-1][1]
+
+    def rock_remaining(self) -> int | None:
+        """Units left in the scanned rock, or None when no rock is targeted."""
+        if not self.target:
+            return None
+        return max(0, self.target.scan_units - self.target.depleted_units)
+
+    def rock_depletion_rate(self, now_epoch: float | None = None) -> float:
+        """Units per minute coming off the rock (mined + residue); 0 when idle
+        or still warming up.
+
+        Measured over CYCLES, not log lines, and the first burst's units are
+        deliberately left out of the numerator: they were removed before the
+        window opened. Counting them would inflate the rate by
+        bursts/(bursts-1) - a 50% overshoot at three bursts - which reads as a
+        countdown that is confidently too short.
+        """
+        if not self.target:
+            return 0.0
+        ticks = self.ore_tick_times(self.target.ore)
+        if not ticks:
+            return 0.0
+        now_epoch = now_epoch if now_epoch is not None else time.time()
+        if now_epoch - ticks[-1][0] > RATE_IDLE_S:
+            return 0.0
+        bursts = tick_bursts(ticks)
+        span = bursts[-1][0] - bursts[0][0]
+        # Below the warm-up threshold the rate is noise, not a number.
+        if len(bursts) < ROCK_WARMUP_BURSTS or span < ROCK_WARMUP_S:
+            return 0.0
+        return sum(u for _, u in bursts[1:]) / (span / 60.0)
+
+    def rock_status(self, now_epoch: float | None = None) -> str:
+        """Why there is (or isn't) a rock ETA: 'ready', 'warmup', or 'idle'.
+
+        The UI needs to tell these apart. A bare "-" during warm-up reads as a
+        broken feature; saying so costs nothing and buys trust.
+        """
+        if not self.target:
+            return "idle"
+        now_epoch = now_epoch if now_epoch is not None else time.time()
+        ticks = self.ore_tick_times(self.target.ore)
+        if not ticks or now_epoch - ticks[-1][0] > RATE_IDLE_S:
+            # Mining something else is not the same as not mining: a tracked
+            # rock nobody is touching would otherwise sit at a frozen count
+            # forever, looking live. Name it so the UI can say so.
+            other = self.mining_ore(now_epoch)
+            return "mismatch" if other else "idle"
+        bursts = tick_bursts(ticks)
+        span = bursts[-1][0] - bursts[0][0]
+        if len(bursts) < ROCK_WARMUP_BURSTS or span < ROCK_WARMUP_S:
+            return "warmup"
+        return "ready"
+
+    def rock_active(self, now_epoch: float | None = None) -> bool:
+        """Is this rock demonstrably being mined RIGHT NOW?
+
+        True only when a tick naming this rock's own ore landed within
+        RATE_IDLE_S. Every mining line names its ore, so this is evidence read
+        from the log - not an assumption that the ship never moved. A pilot
+        busily mining a DIFFERENT ore is not on this rock and reads False.
+        """
+        if not self.target:
+            return False
+        ticks = self.ore_tick_times(self.target.ore)
+        if not ticks:
+            return False
+        now_epoch = now_epoch if now_epoch is not None else time.time()
+        return now_epoch - ticks[-1][0] <= RATE_IDLE_S
+
+    def rock_eta_s(self, now_epoch: float | None = None) -> float | None:
+        """Seconds until the scanned rock is dry; None when unknown."""
+        remaining = self.rock_remaining()
+        if not remaining:
+            return None
+        rate = self.rock_depletion_rate(now_epoch)
+        if rate <= 0:
+            return None
+        return remaining / rate * 60.0
 
     def mining_rate_m3_min(self, now_epoch: float | None = None) -> float:
         """Current mining speed in m3/min over the rolling window;
@@ -335,6 +575,67 @@ class CharacterState:
         return 100.0 * self.est_m3 / self.capacity if self.capacity else 0.0
 
 
+def tick_bursts(ticks: list[tuple[float, int]]) -> list[tuple[float, int]]:
+    """[(epoch, units)] -> one (burst_start, units_in_burst) entry per cycle.
+
+    Collapses a multi-laser volley (and the residue line trailing it) into the
+    single mining cycle it really is, so a rate is measured per cycle rather
+    than per log line.
+    """
+    bursts: list[tuple[float, int]] = []
+    for ep, units in ticks:
+        if bursts and ep - bursts[-1][0] <= BURST_GAP_S:
+            start, total = bursts[-1]
+            bursts[-1] = (start, total + units)
+        else:
+            bursts.append((ep, units))
+    return bursts
+
+
+# ---------------------------------------------------------------------------
+# Scanned-rock countdown (gauge inner ring)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RockCountdown:
+    """The tracked rock that will run dry first, across all characters."""
+    character: str
+    ore: str
+    remaining: int
+    fraction: float          # units left / units at scan: 1.0 -> 0.0
+    eta_s: float | None      # None while warming up or idle
+
+
+def fastest_rock(chars, now_epoch: float | None = None) -> "RockCountdown | None":
+    """Pick the rock the fleet will exhaust soonest; None when none tracked.
+
+    Ranked by ETA (soonest first) because that is the thing a miner has to
+    react to. Characters with no ETA yet (warm-up or idle) sort last, broken
+    by how little of their rock is left.
+
+    `fraction` is deliberately units-based, not time-based: it is defined the
+    instant a scan is pasted (no warm-up dead zone), and it only ever moves
+    down, because depleted_units only goes up. A time-based ratio would jump
+    backwards every time the rate estimate wobbled. At a steady rate the two
+    are the same curve anyway - units left IS time left.
+    """
+    best = None
+    best_key = None
+    for c in chars:
+        remaining = c.rock_remaining()
+        if not remaining:            # no rock targeted, or already dry
+            continue
+        fraction = min(1.0, remaining / max(1, c.target.scan_units))
+        eta_s = c.rock_eta_s(now_epoch)
+        key = (eta_s if eta_s is not None else float("inf"), fraction)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = RockCountdown(character=c.name, ore=c.target.ore,
+                                 remaining=remaining, fraction=fraction,
+                                 eta_s=eta_s)
+    return best
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -348,7 +649,8 @@ class Engine:
                  compressed_leaves_hold: bool = True,
                  combat_enabled: bool = True,
                  ledger_path: Path | None = None,
-                 ledger_enabled: bool = False):
+                 ledger_enabled: bool = False,
+                 sde_paths: list[Path] | None = None):
         self.log_dir = Path(log_dir)
         self.state_path = Path(state_path)
         self.lookback_hours = lookback_hours
@@ -372,13 +674,24 @@ class Engine:
         #         snapshot; quantities stay exact, only the ISK basis is
         #         stored so past days keep their worth-when-mined)
         # marks:  char -> high-water log ts (replay-safe accrual)
-        self.ledger = {"marks": {}, "days": {}, "prices": {}}
+        # activity: day -> char -> state -> seconds spent in that state
+        #         (mining / idle / full / offline). Forward-accumulated from
+        #         live ticks by the GUI; not derived from logs on replay.
+        self.ledger = {"marks": {}, "mark_counts": {}, "reads": {},
+                       "days": {}, "prices": {}, "activity": {}}
+        # per-run, per-character (ts, ticks seen in that second) - see
+        # _tick_ordinal
+        self._seen_at: dict[str, tuple[str, int]] = {}
         self._load_ledger()
-        self.table = OreTable(ore_override_path)
+        self._sde_paths = list(sde_paths or [])
+        self.table = OreTable(ore_override_path, self._sde_paths)
         pats = mining_patterns or DEFAULT_MINING_PATTERNS
         self.patterns = [re.compile(p, re.IGNORECASE) for p in pats]
         self.files: dict[str, LogFile] = {}
         self.chars: dict[str, CharacterState] = {}
+        # character -> (ts, ore) of the most recent mining tick, used to give
+        # the ore-less residue line an ore name
+        self._last_tick: dict[str, tuple[str, str]] = {}
         self._last_scan = 0.0
         self._warned_missing_dir = False
         self._unmatched_logged = 0
@@ -389,6 +702,11 @@ class Engine:
                  self.log_dir, self.log_dir.is_dir(), lookback_hours,
                  compressed_leaves_hold, len(self.patterns))
         self.load_state()
+
+    def reload_sde(self, paths: list[Path]) -> None:
+        """Reload SDE volumes after a catalog update."""
+        self._sde_paths = list(paths)
+        self.table.load_sde(self._sde_paths)
 
     # -- persistence --------------------------------------------------------
     def load_state(self):
@@ -409,13 +727,38 @@ class Engine:
                 anchor_ts=str(d.get("anchor_ts", "")),
                 anchor_m3=anchor_m3,
             )
+            td = d.get("target")
+            if isinstance(td, dict) and td.get("ore"):
+                self.chars[name].target = TargetRock(
+                    ore=str(td["ore"]),
+                    scan_units=int(td.get("scan_units", 0)),
+                    scan_ts=str(td.get("scan_ts", "")),
+                    distance_m=float(td.get("distance_m", 0.0)),
+                    # always 0: the replay below rebuilds it (see save_state).
+                    # Older state files carry a depleted_units key; ignoring
+                    # it is what makes the restart idempotent.
+                    depleted_units=0,
+                )
 
     def save_state(self):
-        data = {"characters": {
-            c.name: {"capacity": c.capacity, "last_event": c.last_event,
-                     "notified": c.notified, "anchor_ts": c.anchor_ts,
-                     "anchor_m3": c.anchor_m3}
-            for c in self.chars.values()}}
+        chars = {}
+        for c in self.chars.values():
+            d = {"capacity": c.capacity, "last_event": c.last_event,
+                 "notified": c.notified, "anchor_ts": c.anchor_ts,
+                 "anchor_m3": c.anchor_m3}
+            if c.target:
+                # Only the ANCHOR is persisted, exactly like anchor_ts /
+                # anchor_m3 for the hold. depleted_units is a running total of
+                # replayed ticks, so writing it down and then replaying the
+                # same ticks on the next start counts them twice - the rock
+                # reads half-empty and can even vanish as "exhausted". It is
+                # recomputed from scan_ts on every startup instead.
+                d["target"] = {"ore": c.target.ore,
+                               "scan_units": c.target.scan_units,
+                               "scan_ts": c.target.scan_ts,
+                               "distance_m": c.target.distance_m}
+            chars[c.name] = d
+        data = {"characters": chars}
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             self.state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -430,10 +773,36 @@ class Engine:
             data = json.loads(self.ledger_path.read_text(encoding="utf-8"))
             if isinstance(data.get("days"), dict):
                 self.ledger = {"marks": dict(data.get("marks", {})),
+                               "mark_counts": dict(data.get("mark_counts", {})),
+                               "reads": dict(data.get("reads", {})),
                                "days": data["days"],
-                               "prices": dict(data.get("prices", {}))}
+                               "prices": dict(data.get("prices", {})),
+                               "activity": dict(data.get("activity", {}))}
         except Exception as e:
             log.warning("ledger load failed: %s", e)
+        self._prune_reads()
+
+    def _prune_reads(self):
+        """Forget read positions for gamelogs that no longer exist.
+
+        Bounded growth: EVE writes one file per client session and never
+        deletes them, so this dict would otherwise accumulate an entry per
+        session forever. Deliberately conservative - if the folder cannot be
+        listed, or lists empty, nothing is dropped. Wrongly dropping an entry
+        re-banks a whole file, so "do nothing" is always the safer failure.
+        """
+        reads = self.ledger.get("reads")
+        if not reads:
+            return
+        try:
+            present = {p.name for p in self.log_dir.iterdir()
+                       if p.suffix.lower() == ".txt"}
+        except OSError:
+            return
+        if not present:
+            return
+        for gone in [k for k in reads if k not in present]:
+            reads.pop(gone, None)
 
     def snapshot_prices(self, day: str, price_map: dict) -> bool:
         """Freeze the given day's ISK price basis. Overwrites only the day
@@ -451,26 +820,100 @@ class Engine:
         if not self.ledger_path:
             return
         days = self.ledger["days"]
-        keep = set(sorted(days)[-400:])   # ~13 months of history
+        activity = self.ledger.setdefault("activity", {})
+        # keep window spans BOTH mined-ore days and activity days: a day can
+        # have logged time-in-state without a single mining event (all idle)
+        all_days = set(days) | set(activity)
+        keep = set(sorted(all_days)[-400:])   # ~13 months of history
         for old in [d for d in days if d not in keep]:
             days.pop(old, None)
         for old in [d for d in self.ledger["prices"] if d not in keep]:
             self.ledger["prices"].pop(old, None)
+        for old in [d for d in activity if d not in keep]:
+            activity.pop(old, None)
         try:
             self.ledger_path.write_text(
                 json.dumps(self.ledger, indent=1), encoding="utf-8")
         except OSError as e:
             log.warning("ledger save failed: %s", e)
 
-    def _ledger_add(self, ev: MiningEvent) -> bool:
-        mark = self.ledger["marks"].get(ev.character, "")
-        if mark and ev.ts <= mark:
-            return False                # already counted (replay)
+    def _ledger_add(self, ev: MiningEvent, fname: str, line_no: int) -> bool:
+        """Accrue one tick into the daily ledger, exactly once ever.
+
+        The ledger is the only consumer that cannot rebuild itself: it
+        accumulates across days, and its source lines eventually age out of
+        the lookback window. So unlike est_m3 and depleted_units - which are
+        thrown away and recomputed from an anchor on every start - it has to
+        remember its own position and resume.
+
+        That position is (gamelog filename, line number). It is the identity
+        the reader already uses, and it is exact: EVE writes one append-only
+        file per client session and never rotates or truncates one, so line N
+        of a file is always line N.
+
+        Timestamps cannot do this job. They are second-resolution, and a
+        mining second is rarely one tick - every laser reports separately and
+        a critical success always shares the second of the tick it bonuses.
+        The old "ts <= mark" test threw away every tick after the first in
+        each second: 45% of a real ice-mining session, and 100% of its crits.
+        """
+        ordinal = self._tick_ordinal(ev)
+        reads = self.ledger["reads"]
+        pos = reads.get(fname)
+        if pos is not None:
+            if line_no < int(pos.get("lines", 0)):
+                return False        # this exact line is already banked
+        elif self._legacy_banked(ev, ordinal):
+            # Upgrade path: this file predates per-file positions, so fall
+            # back to the old per-character timestamp mark to decide. From
+            # here on the file gets a real position and never needs it again.
+            return False
         day = ev.ts[:10]                # "YYYY.MM.DD" (UTC == EVE time)
         per_char = self.ledger["days"].setdefault(day, {})
         ores_d = per_char.setdefault(ev.character, {})
         ores_d[ev.ore] = ores_d.get(ev.ore, 0) + ev.qty
+        entry = reads.setdefault(fname, {"lines": 0, "bytes": 0})
+        entry["lines"] = line_no + 1
+        # Keep the old marks current too, so rolling the build back (this ships
+        # as a folder swap) resumes correctly instead of re-banking the day.
         self.ledger["marks"][ev.character] = ev.ts
+        self.ledger["mark_counts"][ev.character] = ordinal
+        return True
+
+    def _tick_ordinal(self, ev: MiningEvent) -> int:
+        """1-based index of this tick among that character's ticks in its
+        second. Counted for EVERY tick, banked or skipped, so it stays aligned
+        with what a replay sees."""
+        last_ts, n = self._seen_at.get(ev.character, ("", 0))
+        n = n + 1 if last_ts == ev.ts else 1
+        self._seen_at[ev.character] = (ev.ts, n)
+        return n
+
+    def _legacy_banked(self, ev: MiningEvent, ordinal: int) -> bool:
+        """Pre-position ledgers marked progress as (timestamp, ticks banked in
+        that second). Only consulted for files with no recorded position."""
+        mark = self.ledger["marks"].get(ev.character, "")
+        if not mark:
+            return False
+        if ev.ts < mark:
+            return True
+        if ev.ts == mark:
+            # ledgers written before mark_counts existed banked exactly one
+            # tick for the mark second, so assume 1
+            return ordinal <= self.ledger["mark_counts"].get(ev.character, 1)
+        return False
+
+    def activity_add(self, character: str, state: str, seconds: float,
+                     day: str | None = None) -> bool:
+        """Add `seconds` of wall-clock time to (day, character, state).
+        State is one of mining/idle/full/offline. Returns True if anything
+        was recorded (so the caller can mark the ledger dirty)."""
+        if not state or seconds <= 0:
+            return False
+        day = day or now_ts()[:10]      # "YYYY.MM.DD" (UTC == EVE time)
+        per_char = self.ledger.setdefault("activity", {}).setdefault(day, {})
+        states = per_char.setdefault(character, {})
+        states[state] = states.get(state, 0.0) + float(seconds)
         return True
 
     # -- character helpers ---------------------------------------------------
@@ -507,6 +950,9 @@ class Engine:
             c.notified = False
             c.rate_events.clear()  # replay refills these; keeping them would
                                    # double-count the rate and wreck the ETA
+            c.ore_ticks.clear()    # same for the per-ore rock rate history
+            if c.target:           # and for the rock's own depletion total
+                c.target.depleted_units = 0
         self.files.clear()      # forget offsets -> re-read from byte 0
         self._last_scan = 0.0   # force immediate rediscovery
         self.save_state()
@@ -520,6 +966,98 @@ class Engine:
         if c.est_m3 < c.capacity:
             c.notified = False
         self.save_state()
+
+    # -- scanned rock ---------------------------------------------------------
+    def set_target(self, character: str, ore: str, units: int,
+                   distance_m: float):
+        """Anchor a scanned rock to a character. Re-pasting re-anchors."""
+        c = self.char(character)
+        c.target = TargetRock(ore=ore, scan_units=int(units), scan_ts=now_ts(),
+                              distance_m=float(distance_m))
+        # NOTE: ore_ticks is deliberately NOT cleared. The pilot was already
+        # mining when they pasted the scan, and how fast they chew this ore is
+        # measured from that history - so the countdown starts with a real
+        # rate instead of waiting a cycle to rediscover what we already knew.
+        log.info("target: %s -> %s %d units @ %.0f m",
+                 character, ore, units, distance_m)
+        self.save_state()
+
+    def clear_target(self, character: str):
+        c = self.chars.get(character)
+        if not c:
+            return
+        c.target = None
+        self.save_state()
+
+    def abandon_target(self, character: str, reason: str) -> bool:
+        """Drop a tracked rock, saying why. No-op when nothing is tracked.
+
+        Every path that invalidates a rock funnels through here so the reason
+        is always in the log - a countdown that vanishes without explanation
+        looks like a bug.
+        """
+        c = self.chars.get(character)
+        if not c or not c.target:
+            return False
+        log.info("target: %s dropping %s rock (%s)",
+                 character, c.target.ore, reason)
+        self.clear_target(character)
+        return True
+
+    def rock_popped(self, character: str):
+        """An observed pop (drone stop) outranks arithmetic - spec D4."""
+        self.abandon_target(character, "popped (observed)")
+
+    def left_system(self, character: str):
+        """Abandon the tracked rock: asteroids are grid-local, and scanner
+        distances are measured from the ship, so a rock scanned in the system
+        you just left can never be the one you are mining now."""
+        self.abandon_target(character, "left the system")
+
+    def client_closed(self, character: str) -> bool:
+        """The EVE client went away. Docking, ship swaps and belt changes all
+        happen unobserved while it is shut, so whatever is mined next is not
+        provably this rock - and a countdown nobody is watching keeps ticking
+        down to a "dry" that never happened."""
+        return self.abandon_target(character, "client closed")
+
+    def drop_stale_targets(self, now_epoch: float | None = None) -> list[str]:
+        """Startup sweep: keep only rocks the logs show still being mined.
+
+        The target survives a restart (that is the point of persisting it),
+        but surviving is conditional: after the replay, a rock with no tick of
+        its own ore in the last RATE_IDLE_S is a rock the pilot has already
+        walked away from. Restoring that would show a confident countdown for
+        an asteroid that may not exist any more.
+        """
+        dropped = []
+        for name, c in list(self.chars.items()):
+            if c.target and not c.rock_active(now_epoch):
+                if self.abandon_target(name, "not mining it at startup"):
+                    dropped.append(name)
+        return dropped
+
+    def _apply_depletion(self, ev):
+        """Count a mining or residue event against the character's rock.
+
+        Gated on the rock's own scan_ts, independent of the hold anchor, so a
+        calibration newer than the scan cannot silently stop depletion.
+        """
+        c = self.chars.get(ev.character)
+        if not c:
+            return
+        # Rate history first, and for EVERY ore: it is how fast this ship
+        # chews rock, which is true whether or not the tick matches the
+        # tracked one - and knowing what else they are mining is what lets a
+        # frozen countdown be reported instead of just sitting there.
+        c.note_tick(ts_to_epoch(ev.ts), ev.ore, ev.qty)
+        if not c.target or ev.ore != c.target.ore:
+            return
+        if ev.ts <= c.target.scan_ts:   # log timestamps sort lexicographically
+            return
+        c.target.depleted_units += ev.qty
+        if c.rock_remaining() <= 0:
+            self.abandon_target(ev.character, "exhausted by count")
 
     def set_capacity(self, name: str, m3: float):
         c = self.char(name)
@@ -577,11 +1115,25 @@ class Engine:
             if not lines:
                 continue
             self.stats["lines"] += len(lines)
+            fname = lf.path.name
+            if lf.first_line_no == 0:
+                self._check_truncated(fname, lf.offset)
             name = lf.character or lf.path.stem
-            for ln in lines:
+            for i, ln in enumerate(lines):
+                line_no = lf.first_line_no + i
                 ev = self._parse_line(name, ln)
                 if ev is None:
                     continue
+                # Rock depletion runs BEFORE the hold anchor filter below:
+                # the anchor is about cargo, and a calibration newer than the
+                # scan must not silently freeze the countdown. _apply_depletion
+                # gates on the rock's own scan_ts instead.
+                if isinstance(ev, (MiningEvent, ResidueEvent)):
+                    self._apply_depletion(ev)
+                elif isinstance(ev, DroneStopEvent):
+                    self.rock_popped(ev.character)
+                elif isinstance(ev, SystemChangeEvent):
+                    self.left_system(ev.character)
                 # anchor filter: log events at/before a character's last
                 # reset/calibration are already baked into anchor_m3 -
                 # skipping them makes startup replay idempotent.
@@ -591,7 +1143,8 @@ class Engine:
                 # cargo - they never create rows or pass the anchor filter
                 ev_ts = getattr(ev, "ts", None)
                 if (ev_ts is not None and
-                        not isinstance(ev, (CombatEvent, DroneStopEvent))):
+                        not isinstance(ev, (CombatEvent, DroneStopEvent,
+                                            SystemChangeEvent))):
                     c = self.char(ev.character)
                     if c.anchor_ts and ev_ts <= c.anchor_ts:
                         continue
@@ -601,7 +1154,8 @@ class Engine:
                     self.stats["mining_events"] += 1
                     log.debug("mining: %s +%d %s = %.1f m3",
                               ev.character, ev.qty, ev.ore, ev.m3)
-                    if self.ledger_enabled and self._ledger_add(ev):
+                    if (self.ledger_enabled and
+                            self._ledger_add(ev, fname, line_no)):
                         ledger_dirty = True
                     c = self.char(ev.character)
                     c.est_m3 += ev.m3
@@ -631,11 +1185,38 @@ class Engine:
                 elif isinstance(ev, UnknownOreEvent):
                     c = self.char(ev.character)
                     c.unknown_ores[ev.ore] = c.unknown_ores.get(ev.ore, 0) + ev.qty
+                elif isinstance(ev, ResidueEvent):
+                    self.stats["residue_events"] = (
+                        self.stats.get("residue_events", 0) + 1)
+                    # NOTE: no est_m3 change - residue never enters the hold.
+            entry = self.ledger.get("reads", {}).get(fname)
+            if entry is not None:
+                # The gate is the line number; the byte offset rides along as
+                # the truncation sentinel and as a human-readable "how far did
+                # we get" when reading ledger.json by hand.
+                entry["bytes"] = lf.offset
         if dirty:
             self.save_state()
         if ledger_dirty:
             self.save_ledger()
         return events
+
+    def _check_truncated(self, fname: str, size: int):
+        """A gamelog that shrank is not the file we recorded a position in.
+
+        EVE never rewrites or rotates a gamelog, so this should never fire -
+        but a stale position on replaced content would silently skip real
+        mining, which is worse than re-banking it.
+        """
+        entry = self.ledger.get("reads", {}).get(fname)
+        if entry and size < int(entry.get("bytes", 0)):
+            log.warning("gamelog %s shrank (%d < %d) - re-reading it",
+                        fname, size, entry.get("bytes", 0))
+            # Rewound, NOT removed: an absent position falls back to the old
+            # per-character timestamp mark, which would skip the replacement
+            # content instead of reading it.
+            entry["lines"] = 0
+            entry["bytes"] = 0
 
     def _parse_line(self, character: str, line: str):
         m = LINE_RE.match(line)
@@ -644,15 +1225,24 @@ class Engine:
         channel = m.group("channel").strip().lower()
         if channel == "combat":
             return self._parse_combat(character, m) if self.combat_enabled else None
+        # Jump lines arrive on the "(None)" channel, so this must come before
+        # the MINING_CHANNELS filter below.
+        jm = SYSTEM_CHANGE_RE.search(TAG_RE.sub("", m.group("msg")).strip())
+        if jm:
+            return SystemChangeEvent(character=character,
+                                     to_system=jm.group("to_sys").strip(),
+                                     ts=m.group("ts"))
         if channel not in MINING_CHANNELS:
             return None
         msg = TAG_RE.sub("", m.group("msg")).strip()
         low = msg.lower()
         if channel == "notify" and any(k in low for k in HOLD_FULL_MARKERS):
             return HoldFullEvent(character=character, ts=m.group("ts"))
-        if (channel == "notify" and self.drone_enabled and
-                DRONE_STOP_RE.search(msg)):
-            return DroneStopEvent(character=character, ts=m.group("ts"))
+        if channel == "notify" and self.drone_enabled:
+            dm = DRONE_STOP_RE.search(msg)
+            if dm:
+                return DroneStopEvent(character=character, ts=m.group("ts"),
+                                      module=dm.group("module").strip())
         cm = COMPRESS_RE.search(msg)
         if cm:
             qty = parse_qty(cm.group("qty"))
@@ -669,6 +1259,21 @@ class Engine:
                 delta = qty * (comp_vol - raw_vol)
             return CompressionEvent(character=character, qty=qty, ore=ore,
                                     delta_m3=delta, ts=m.group("ts"))
+        # Must come BEFORE the EXCLUDE_MARKERS check: "residue" is in that
+        # list (correctly - these units never enter the hold), but they do
+        # deplete the asteroid, so a scanned rock has to see them.
+        rm = RESIDUE_RE.search(msg)
+        if rm:
+            qty = parse_qty(rm.group("qty"))
+            last = self._last_tick.get(character)
+            if qty <= 0 or not last:
+                return None
+            last_ts, last_ore = last
+            gap = ts_to_epoch(m.group("ts")) - ts_to_epoch(last_ts)
+            if not (0 <= gap <= RESIDUE_PAIR_S):
+                return None
+            return ResidueEvent(character=character, qty=qty, ore=last_ore,
+                                ts=m.group("ts"))
         if any(k in low for k in EXCLUDE_MARKERS):
             return None
         for pat in self.patterns:
@@ -683,8 +1288,13 @@ class Engine:
             if vol is None:
                 log.warning("unknown ore '%s' (qty %d) from %s", ore, qty, character)
                 return UnknownOreEvent(character=character, ore=ore, qty=qty)
+            self._last_tick[character] = (m.group("ts"), ore)
+            crit = bool(CRIT_RE.search(msg))
+            if crit:
+                self.stats["crit_events"] = self.stats.get("crit_events", 0) + 1
+                self.stats["crit_units"] = self.stats.get("crit_units", 0) + qty
             return MiningEvent(character=character, qty=qty, ore=ore,
-                               m3=qty * vol, ts=m.group("ts"))
+                               m3=qty * vol, ts=m.group("ts"), crit=crit)
         if channel == "mining":
             # a (mining) line none of our patterns matched - the one thing
             # we most need to see when diagnosing "nothing is changing"

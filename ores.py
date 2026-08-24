@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LittlePhish
 """Ore unit volumes (m3 per unit) for EVE Online.
 
 Lookup rules used by engine.unit_volume():

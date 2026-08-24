@@ -1,3 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LittlePhish
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version. It is distributed WITHOUT ANY WARRANTY; see the GNU
+# General Public License (the LICENSE file, or <https://www.gnu.org/licenses/>)
+# for details.
 """Ore Hold Watcher - local EVE Online ore hold tracker.
 
 Sits in the system tray, tails your EVE gamelogs, estimates each character's
@@ -26,19 +35,24 @@ log = logging.getLogger("orewatcher.app")
 from PySide6.QtCore import Qt, QTimer, QSize, QRect
 from PySide6.QtGui import (QAction, QBrush, QColor, QIcon, QPainter, QPen,
                            QPixmap, QFont)
-from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox,
-                               QDoubleSpinBox, QFileDialog, QFormLayout,
-                               QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-                               QMainWindow, QMenu, QMessageBox, QProgressBar,
-                               QPushButton, QScrollArea, QSpinBox,
-                               QSystemTrayIcon, QVBoxLayout, QWidget,
-                               QCheckBox)
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog,
+                               QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+                               QFormLayout, QHBoxLayout, QInputDialog, QLabel,
+                               QLineEdit, QMainWindow, QMenu, QMessageBox,
+                               QPlainTextEdit, QProgressBar, QPushButton,
+                               QScrollArea, QSpinBox, QSystemTrayIcon,
+                               QVBoxLayout, QWidget, QCheckBox)
 
 from engine import (Engine, MiningEvent, HoldFullEvent, UnknownOreEvent,
-                    CombatEvent, DroneStopEvent, ts_to_epoch)
+                    CombatEvent, DroneStopEvent, fastest_rock, ts_to_epoch)
+from scan import parse_scan
+from sde import update_catalog
 
 APP_NAME = "Ore Hold Watcher"
 ORG_DIR = "OreHoldWatcher"
+# Stable Windows identity for the taskbar button and toast notifications, so
+# both behave the same however the app is launched (see set_app_user_model_id).
+APP_USER_MODEL_ID = "LittlePhish.OreHoldWatcher"
 DEFAULT_UPDATE_REPO = "littlephish/ore-hold-watcher"
 # Fallback version for source runs. The built exe carries the real version
 # stamped from the git tag by release.yml; that wins when available.
@@ -78,34 +92,58 @@ def _writable(d: Path) -> bool:
 
 
 _CONFIG_DIR: Path | None = None
-_CONFIG_FILES = ("settings.json", "state.json", "ores_override.json")
+# every file kept in the config dir - used for one-time migration when the
+# config location moves between the portable (beside-exe) and AppData layouts
+_CONFIG_FILES = ("settings.json", "state.json", "ores_override.json",
+                 "ledger.json", "prices.json", "sde_volumes.json")
+
+
+def _migrate_config(src: Path, dst: Path) -> None:
+    """Copy any config files present in `src` into `dst`, never overwriting."""
+    if not src.is_dir() or src.resolve() == dst.resolve():
+        return
+    import shutil
+    for f in _CONFIG_FILES:
+        s = src / f
+        if s.exists() and not (dst / f).exists():
+            try:
+                shutil.copy2(s, dst / f)
+            except OSError:
+                pass
 
 
 def config_dir() -> Path:
-    """Config lives BESIDE THE EXE (portable). Falls back to APPDATA when
-    that folder isn't writable. Existing APPDATA config is migrated (copied)
-    the first time, so nothing is lost."""
+    """Where settings / state / ledger live.
+
+    Installed and packaged builds keep config in %APPDATA%\\OreHoldWatcher,
+    OUTSIDE the program folder, so the folder-swap updater and the uninstaller
+    never touch user data. Source runs stay portable (beside the source tree)
+    for convenient dev. A one-time migration copies any config found in the
+    other location, so nothing is lost when the layout changes."""
     global _CONFIG_DIR
     if _CONFIG_DIR is not None:
         return _CONFIG_DIR
-    portable = app_base_dir()
-    if _writable(portable):
-        d = portable
-        old = _appdata_dir()
-        if old.is_dir() and not (d / "settings.json").exists():
-            import shutil
-            for f in _CONFIG_FILES:
-                src = old / f
-                if src.exists() and not (d / f).exists():
-                    try:
-                        shutil.copy2(src, d / f)
-                    except OSError:
-                        pass
+    appdata = _appdata_dir()
+    beside = app_base_dir()
+    if is_frozen() or is_packaged():
+        appdata.mkdir(parents=True, exist_ok=True)
+        d = appdata
+        _migrate_config(beside, d)      # honor a portable config placed by hand
+    elif _writable(beside):
+        d = beside
+        _migrate_config(appdata, d)     # pick up any prior AppData config once
     else:
-        d = _appdata_dir()
-        d.mkdir(parents=True, exist_ok=True)
+        appdata.mkdir(parents=True, exist_ok=True)
+        d = appdata
     _CONFIG_DIR = d
     return d
+
+
+def sde_catalog_paths() -> list[Path]:
+    """Downloaded catalog wins over the catalog bundled with the build."""
+    paths = [config_dir() / "sde_volumes.json",
+             app_base_dir() / "sde_volumes.json"]
+    return [p for p in paths if p.exists()]
 
 
 _LOG_FMT = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
@@ -199,6 +237,7 @@ DEFAULT_SETTINGS = {
     "alert_interval_min": 5.0,  # at most one alert per X minutes (0 = every alert)
     "idle_alert_enabled": True,  # alert when a pilot stops receiving ore ticks
     "idle_alert_min": 5.0,       # ... for this many minutes
+    "allclear_enabled": False,   # green "resolved" note when an issue clears
     "combat_alert_enabled": False,  # scan/alert on PLAYER aggression (never NPC)
     "combat_alert_cooldown_s": 120,  # per-pilot cooldown between combat alerts
     "drone_alert_enabled": False,   # alert when mining drones stop (rock depleted)
@@ -281,7 +320,7 @@ QPushButton {
     background: #4e5058; border: none; border-radius: 4px;
     padding: 5px 12px; color: #fff;
 }
-QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {
+QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox, QPlainTextEdit {
     background: #ffffff; color: #000000;
     border: 1px solid #1e1f22; border-radius: 4px; padding: 3px 6px;
     selection-background-color: #5865f2; selection-color: #ffffff;
@@ -372,6 +411,7 @@ class ClientWatcher:
         self.online: set[str] = set()   # character names with a live window
         self.clients = 0                # EVE windows seen (incl. char select)
         self.ready = False              # at least one successful refresh
+        self.last_focused: str | None = None   # most recent foreground pilot
 
     def refresh(self):
         if sys.platform != "win32":
@@ -382,6 +422,7 @@ class ClientWatcher:
             user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
             found: set[str] = set()
             count = [0]
+            fg = user32.GetForegroundWindow()
 
             @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
             def enum_cb(hwnd, _):
@@ -409,7 +450,13 @@ class ClientWatcher:
                         if exe in self.process_names:
                             count[0] += 1
                             if " - " in title:
-                                found.add(title.split(" - ", 1)[1].strip())
+                                who = title.split(" - ", 1)[1].strip()
+                                found.add(who)
+                                # remember which client you were last looking
+                                # at, so a scan pasted after alt-tabbing still
+                                # attributes to the right pilot (spec D3)
+                                if hwnd == fg:
+                                    self.last_focused = who
                 finally:
                     kernel32.CloseHandle(h)
                 return True
@@ -558,6 +605,24 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
 
 
+def is_packaged() -> bool:
+    """True when running inside an MSIX/AppX package. The package install dir
+    is read-only and tamper-protected, so the in-place exe self-updater must
+    stay off - MSIX updates come from App Installer / a reinstall instead."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        length = ctypes.c_uint32(0)
+        # GetCurrentPackageFullName: APPMODEL_ERROR_NO_PACKAGE (15700) when
+        # unpackaged; ERROR_INSUFFICIENT_BUFFER (122) when packaged.
+        rc = ctypes.windll.kernel32.GetCurrentPackageFullName(
+            ctypes.byref(length), None)
+        return rc != 15700
+    except Exception:
+        return False
+
+
 def current_exe_version() -> str | None:
     """Version stamped into the running exe by the release build.
     None when running from source (auto-update is disabled then)."""
@@ -596,17 +661,77 @@ def app_version_str() -> str:
     return f"v{v}" if v else f"v{APP_VERSION} (source)"
 
 
+_EXE_NAME = "OreHoldWatcher.exe"
+
+
+def install_dir() -> Path:
+    """Folder holding the running executable - the thing an update replaces."""
+    return Path(sys.executable).resolve().parent
+
+
+def can_write_install_dir() -> bool:
+    """False when the program folder needs elevation we never request (e.g. a
+    machine-wide Program Files install). Then an in-place update is impossible
+    and we point the user at a reinstall instead of failing silently."""
+    try:
+        probe = install_dir() / ".upd_write_test"
+        probe.write_text("x", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+# Written to a NO-SPACES temp folder and run by cmd.exe to finish an update
+# after we exit. Deliberately cmd + robocopy, NOT PowerShell: a machine
+# ExecutionPolicy of AllSigned/Restricted (locked-down or corporate machines)
+# overrides -ExecutionPolicy Bypass and silently refuses to run an unsigned
+# .ps1 - the swap simply never happens and no log is written. Batch has no such
+# gate. robocopy /MIR mirrors the new program folder over the install dir and
+# removes files an older version left behind; the excludes protect the Inno
+# uninstaller, this log, and any stale staging folder. The install path (which
+# contains spaces - "Ore Hold Watcher") is passed as a quoted arg and read via
+# %~2, so spaces are safe. Args: %1=src folder  %2=install dir  %3=exe name.
+# It ALWAYS relaunches the exe at the end, even if robocopy reported problems,
+# so the app never fails to come back up.
+_SWAP_BAT = r"""@echo off
+setlocal enableextensions
+cd /d "%TEMP%"
+set "SRC=%~1"
+set "DST=%~2"
+set "EXE=%~3"
+set "LOG=%DST%\update-log.txt"
+echo [%date% %time%] updater started: "%SRC%" to "%DST%" > "%LOG%"
+rem give the app a moment to exit so its files unlock (robocopy also retries)
+ping -n 3 127.0.0.1 >nul
+rem mirror the new build over the install; /R:60 /W:1 retries files still held
+rem by a slow exit; excludes protect the uninstaller, this log and old staging
+robocopy "%SRC%" "%DST%" /MIR /XD "%DST%\update" /XF unins000.exe unins000.dat update-log.txt /R:60 /W:1 >> "%LOG%" 2>&1
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] robocopy exit %RC% >> "%LOG%"
+if %RC% GEQ 8 echo [%date% %time%] WARNING: robocopy reported errors (see above) >> "%LOG%"
+echo [%date% %time%] starting "%DST%\%EXE%" >> "%LOG%"
+start "" "%DST%\%EXE%"
+echo [%date% %time%] done >> "%LOG%"
+"""
+
+
 class Updater:
-    """Checks GitHub releases, downloads the new exe, swaps it in place.
-    Network work runs in daemon threads; the UI polls the fields."""
+    """Checks GitHub releases for a newer -win64.zip, downloads it, and swaps
+    the whole program folder in place via a detached PowerShell helper. Network
+    work runs in daemon threads; the UI polls the fields.
+
+    Folder swap, not exe swap: the shipped artifact is a Nuitka --standalone
+    program folder (onefile tripped AV dropper heuristics), so an update is
+    'download the new folder, mirror it over the old one, relaunch'."""
 
     def __init__(self, settings: Settings):
         self.s = settings
         self.busy = False
-        self.available: dict | None = None   # {"version", "url"}
+        self.available: dict | None = None   # {"version", "url", "current"}
         self.up_to_date: str | None = None   # latest tag when already current
         self.error: str | None = None
-        self.downloaded: str | None = None   # path of the fetched .new file
+        self.downloaded: str | None = None   # path of the fetched update .zip
         self.manual = False
 
     def repo(self) -> str:
@@ -616,7 +741,8 @@ class Updater:
                 or DEFAULT_UPDATE_REPO)
 
     def can_update(self) -> bool:
-        return bool(self.repo()) and is_frozen() and sys.platform == "win32"
+        return (bool(self.repo()) and is_frozen() and sys.platform == "win32"
+                and not is_packaged() and can_write_install_dir())
 
     # -- phase 1: check ------------------------------------------------------
     def check_async(self, manual: bool = False):
@@ -635,8 +761,10 @@ class Updater:
             with urllib.request.urlopen(req, timeout=15) as r:
                 data = json.loads(r.read().decode("utf-8"))
             tag = str(data.get("tag_name", ""))
+            # the portable program-folder zip; keep "win" in the asset name
             asset = next((a for a in data.get("assets", [])
-                          if a.get("name", "").lower().endswith(".exe")), None)
+                          if a.get("name", "").lower().endswith(".zip")
+                          and "win" in a.get("name", "").lower()), None)
             cur = current_exe_version() or "0"
             log.info("update check: current=%s latest=%s", cur, tag)
             if asset and parse_ver(tag) > parse_ver(cur):
@@ -660,8 +788,10 @@ class Updater:
                          daemon=True).start()
 
     def _download(self, url: str):
+        import tempfile
         try:
-            dest = sys.executable + ".new"
+            base = Path(tempfile.mkdtemp(prefix="orewatcher-update-"))
+            dest = base / "update.zip"
             req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
             with urllib.request.urlopen(req, timeout=300) as r, \
                     open(dest, "wb") as f:
@@ -670,11 +800,11 @@ class Updater:
                     if not chunk:
                         break
                     f.write(chunk)
-            if os.path.getsize(dest) < 5_000_000:  # sanity: a real exe is big
+            if dest.stat().st_size < 1_000_000:  # sanity: the folder zip is big
                 raise ValueError("downloaded file suspiciously small")
-            self.downloaded = dest
+            self.downloaded = str(dest)
             log.info("update downloaded: %s (%d bytes)", dest,
-                     os.path.getsize(dest))
+                     dest.stat().st_size)
         except Exception as e:
             log.warning("update download failed: %s", e)
             self.error = str(e)
@@ -682,78 +812,87 @@ class Updater:
             self.busy = False
 
     # -- phase 3: swap + restart ---------------------------------------------
-    def apply(self) -> bool:
-        """Write a swap script that replaces the exe once it unlocks, then
-        relaunches it. Caller must quit right after.
+    def _extract(self, zip_path: Path) -> Path:
+        """Unpack the zip and return the folder that holds the executable
+        (the zip usually nests the program folder one level deep)."""
+        import zipfile
+        out = zip_path.parent / "unpacked"
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(out)
+        if (out / _EXE_NAME).exists():
+            return out
+        for child in out.rglob(_EXE_NAME):
+            return child.parent
+        raise RuntimeError(f"{_EXE_NAME} not found in the downloaded archive")
 
-        Design notes (each fixes a real failure seen in the wild):
-        - No PID wait: a onefile exe's payload PID (os.getpid) isn't the
-          process holding the .exe lock, so waiting on it is unreliable.
-          Instead the script just retries `move` until the file is
-          replaceable - the lock releasing IS the "app has exited" signal.
-        - `ping` for delays, not `timeout`: `timeout` aborts without a
-          console.
-        - Launched with CREATE_BREAKAWAY_FROM_JOB so it escapes the job
-          object a onefile exe puts the app in - otherwise the script is
-          killed the instant the app closes (its job closes with it).
-        - Writes update-log.txt next to the exe so a failed swap is
-          diagnosable."""
-        if not self.downloaded:
-            return False
+    @staticmethod
+    def _spawn_detached(args: list[str]) -> bool:
+        """Launch a helper fully detached so it survives our exit."""
         import subprocess
-        exe = sys.executable
-        new = self.downloaded
-        bat = exe + ".update.bat"
-        logf = exe + ".update-log.txt"
-        sleep1 = "ping -n 2 127.0.0.1 >nul"
-        script = f"""@echo off
-setlocal enableextensions
-set "LOG={logf}"
-echo [%date% %time%] updater started, replacing "{exe}" > "%LOG%"
-{sleep1}
-set /a tries=0
-:swap
-move /y "{new}" "{exe}" >>"%LOG%" 2>&1
-if not errorlevel 1 (
-    echo [%date% %time%] move succeeded after %tries% retries >> "%LOG%"
-    goto relaunch
-)
-set /a tries+=1
-if %tries% geq 60 (
-    echo [%date% %time%] gave up after %tries% retries; relaunching existing >> "%LOG%"
-    goto relaunch
-)
-{sleep1}
-goto swap
-:relaunch
-echo [%date% %time%] starting "{exe}" >> "%LOG%"
-start "" "{exe}"
-echo [%date% %time%] done >> "%LOG%"
-del "%~f0"
-"""
-        try:
-            with open(bat, "w", encoding="ascii") as f:
-                f.write(script)
-        except OSError as e:
-            log.warning("could not write update script: %s", e)
-            return False
-
         DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0x8)
         NEWGROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
         BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x1000000)
-        launched = False
-        # try to break away from the onefile job object first; if the job
-        # forbids breakaway, CreateProcess errors - fall back without it
         for flags in (DETACHED | NEWGROUP | BREAKAWAY, DETACHED | NEWGROUP):
             try:
-                subprocess.Popen(["cmd", "/c", bat], creationflags=flags,
-                                 close_fds=True)
-                launched = True
-                log.info("update swap script launched (flags=0x%x)", flags)
-                break
+                subprocess.Popen(args, creationflags=flags, close_fds=True)
+                log.info("update helper launched: %s (flags=0x%x)",
+                         args[0], flags)
+                return True
             except OSError as e:
                 log.warning("update launch failed (flags=0x%x): %s", flags, e)
-        return launched
+        return False
+
+    def apply(self) -> bool:
+        """Unpack the new build and launch the detached swap helper, returning
+        True so the caller can quit. The helper waits for our exe to unlock,
+        mirrors the new folder over the install dir, and relaunches.
+
+        Preferred helper is the Rust update.exe, run from a temp COPY so it can
+        overwrite the whole install (including update.exe itself) with no
+        interpreter and no self-replace problem. We take it from the NEWLY
+        DOWNLOADED build first, so a fix to the updater ships and takes effect
+        on the very same update; the currently-installed update.exe is the next
+        choice, and a cmd/robocopy batch the last resort. Either way the helper
+        runs from the no-spaces temp dir and the install path is passed as a
+        quoted arg, so 'Ore Hold Watcher' spaces are safe."""
+        if not self.downloaded:
+            return False
+        import shutil
+        try:
+            new_dir = self._extract(Path(self.downloaded))
+        except Exception as e:
+            log.warning("update extract failed: %s", e)
+            self.error = str(e)
+            return False
+        target = install_dir()
+        tmp = Path(self.downloaded).parent
+
+        # prefer the update.exe shipped INSIDE the new build (self-fixing), then
+        # the installed one; run from a temp copy so it can replace its own
+        # installed copy during the swap
+        for source in (new_dir / "update.exe", target / "update.exe"):
+            if not source.exists():
+                continue
+            try:
+                tmp_exe = tmp / "update.exe"
+                shutil.copy2(source, tmp_exe)
+                if self._spawn_detached(
+                        [str(tmp_exe), str(new_dir), str(target), _EXE_NAME]):
+                    return True
+            except OSError as e:
+                log.warning("update.exe helper (%s) failed, trying next: %s",
+                            source, e)
+
+        # last resort: cmd/robocopy (no PowerShell -> immune to execution policy)
+        bat = tmp / "apply_update.bat"
+        try:
+            bat.write_text(_SWAP_BAT, encoding="ascii")
+        except OSError as e:
+            log.warning("could not write fallback update script: %s", e)
+            self.error = str(e)
+            return False
+        return self._spawn_detached(
+            ["cmd", "/c", str(bat), str(new_dir), str(target), _EXE_NAME])
 
 
 class DarkDialog(QDialog):
@@ -777,6 +916,18 @@ def fmt_eta(seconds: float) -> str:
     return "<1m"
 
 
+def fmt_dur(seconds: float) -> str:
+    """Human duration for time-in-state cells: '2h 05m', '37m', '48s'."""
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m:02d}m"
+    return f"{m}m"
+
+
 def fill_color(pct: float) -> str:
     if pct >= 90:
         return "#f23f43"   # red
@@ -785,8 +936,22 @@ def fill_color(pct: float) -> str:
     return "#23a55a"       # green
 
 
-def make_tray_icon(pct: float) -> QIcon:
-    """Donut gauge colored by the fullest character."""
+# Scanned-rock countdown ring. Blue is a channel the fill ring never uses
+# (green/amber/red), so "how full am I" and "how long has this rock got" stay
+# readable as two separate things at 16 px.
+ROCK_RING = "#3987e5"
+ROCK_TRACK = "#1e3a5c"
+
+
+def make_gauge_pixmap(pct: float, rock_frac: float | None = None) -> QPixmap:
+    """Donut gauge colored by the fullest character.
+
+    `rock_frac` (0..1) adds an inner blue countdown ring for the scanned rock
+    that will run dry first. It is the inverse of the fill ring: it starts
+    FULL the moment a scan is pasted and unwinds counter-clockwise back to 12
+    o'clock as the rock is chewed through. None (no rock tracked) draws no
+    inner ring at all, so the icon stays quiet when the feature isn't in use.
+    """
     size = 64
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
@@ -798,14 +963,31 @@ def make_tray_icon(pct: float) -> QIcon:
     if pct > 0:
         p.setPen(QPen(QColor(fill_color(pct)), 10, Qt.SolidLine, Qt.RoundCap))
         p.drawArc(rect, 90 * 16, -int(360 * 16 * min(pct, 100) / 100))
+    num_px = 22
+    if rock_frac is not None:
+        # Geometry picked by eye at both sizes: 3 px of clear canvas between
+        # the rings (at 16 px that is the difference between two rings and one
+        # fat smudge) and enough middle left over that "99" never touches it.
+        inner = pm.rect().adjusted(16, 16, -16, -16)
+        p.setPen(QPen(QColor(ROCK_TRACK), 4))
+        p.drawArc(inner, 0, 360 * 16)   # track: "a rock IS being tracked"
+        if rock_frac > 0:
+            p.setPen(QPen(QColor(ROCK_RING), 4, Qt.SolidLine, Qt.RoundCap))
+            # positive sweep = counter-clockwise = the mirror of the fill ring
+            p.drawArc(inner, 90 * 16, int(360 * 16 * min(rock_frac, 1.0)))
+        num_px = 18                     # shrink to clear the inner ring
     p.setPen(QColor("#dbdee1"))
     f = QFont()
-    f.setPixelSize(22)
+    f.setPixelSize(num_px)
     f.setBold(True)
     p.setFont(f)
     p.drawText(pm.rect(), Qt.AlignCenter, f"{int(round(min(pct, 99)))}")
     p.end()
-    return QIcon(pm)
+    return pm
+
+
+def make_tray_icon(pct: float, rock_frac: float | None = None) -> QIcon:
+    return QIcon(make_gauge_pixmap(pct, rock_frac))
 
 
 # ---------------------------------------------------------------------------
@@ -882,7 +1064,7 @@ class Notifier:
     def _popup(self, title: str, body: str):
         if HAVE_WINOTIFY:
             try:
-                t = Notification(app_id=APP_NAME, title=title, msg=body)
+                t = Notification(app_id=APP_USER_MODEL_ID, title=title, msg=body)
                 t.show()
                 return
             except Exception as e:
@@ -963,6 +1145,8 @@ class Notifier:
         else:
             desc = body
             color = 0xF0B232
+        if (payload or {}).get("allclear"):   # green regardless of fill
+            color = 0x23A55A
         data = {"embeds": [{"title": title, "description": desc[:4000],
                             "color": color,
                             "footer": {"text": "Ore Hold Watcher"}}]}
@@ -1034,6 +1218,71 @@ class CharRow(QWidget):
         lay.setSpacing(4)
         lay.addLayout(top)
         lay.addWidget(self.bar)
+        # Rock countdown: the row's answer to the tray gauge's inner ring.
+        # Same blue, same anchor as the fill bar above it, opposite direction -
+        # it starts full when the scan lands and drains back to the left edge.
+        # Thinner (5 px vs 8) so it reads as subordinate to the hold bar, and
+        # both it and the line below only exist while a rock is tracked
+        # (spec D5) - the window grows only when the feature is in use.
+        self.rockbar = QProgressBar()
+        self.rockbar.setRange(0, 1000)
+        self.rockbar.setTextVisible(False)
+        self.rockbar.setFixedHeight(5)
+        self.rockbar.setStyleSheet(
+            f"QProgressBar {{ background: {ROCK_TRACK}; border: none; "
+            f"border-radius: 2px; }} "
+            f"QProgressBar::chunk {{ background: {ROCK_RING}; "
+            f"border-radius: 2px; }}")
+        self.rockbar.setVisible(False)
+        lay.addWidget(self.rockbar)
+        self.rock = QLabel("")
+        self.rock.setObjectName("rockLine")
+        self.rock.setVisible(False)
+        lay.addWidget(self.rock)
+
+    ROCK_WARN_S = 60.0    # soft alert threshold (spec D6)
+    ROCK_CRIT_S = 20.0
+
+    def update_rock(self, target, remaining, eta_s, pilot_name,
+                    status=None, other_ore=None):
+        """Second line: what rock, how much left, how long, how stale."""
+        if not target:
+            self.rock.setVisible(False)
+            self.rockbar.setVisible(False)
+            return
+        # Units left / units at scan - the same figure the tray ring uses, and
+        # deliberately not a time ratio: it exists from the moment the scan is
+        # pasted and only ever moves down (see engine.fastest_rock).
+        left = max(0, remaining or 0)
+        self.rockbar.setValue(int(1000 * left / max(1, target.scan_units)))
+        self.rockbar.setToolTip(
+            f"{target.ore}: {left:,} of {target.scan_units:,} units left")
+        self.rockbar.setVisible(True)
+        age = time.time() - ts_to_epoch(target.scan_ts)
+        # Mining a different ore is the one state that looks fine and is not:
+        # the count cannot move, so "dry in ..." would be a countdown frozen
+        # forever. Say which ore is actually being mined - the log names it on
+        # every tick - so the wrong rock is obvious instead of silent.
+        if status == "mismatch" and other_ore:
+            middle = f"stalled: mining {other_ore}"
+        else:
+            # No ETA yet -> say so. A bare dash reads as a broken feature.
+            middle = f"dry in {fmt_eta(eta_s) if eta_s else 'measuring…'}"
+        # Anchor age and pilot are always shown: a stale number must look
+        # stale (spec D4), and misattribution must be visible (spec D3).
+        self.rock.setText(
+            f"⛏ {target.ore} · {remaining:,} left · {middle}"
+            f" · as of {fmt_dur(age)} · {pilot_name}")
+        colour = "#949ba4"
+        if status == "mismatch":
+            colour = "#f0b232"
+        elif eta_s is not None:
+            if eta_s <= self.ROCK_CRIT_S:
+                colour = "#f23f43"
+            elif eta_s <= self.ROCK_WARN_S:
+                colour = "#f0b232"
+        self.rock.setStyleSheet(f"color: {colour}; font-size: 11px;")
+        self.rock.setVisible(True)
 
     ARM_STYLES = {
         "armed":   ("⛏ armed",   "#23a55a"),
@@ -1076,6 +1325,9 @@ class CharRow(QWidget):
         m.addAction("Set current m³…", lambda: self.main.calibrate_char(self.name))
         m.addAction("Set capacity…", lambda: self.main.capacity_char(self.name))
         m.addSeparator()
+        m.addAction("Paste survey scan…",
+                    lambda: ScanPasteDialog(self.main, self.name).exec())
+        m.addSeparator()
         m.addAction("Remove from list", lambda: self.main.remove_char(self.name))
         m.exec(self.mapToGlobal(pos))
 
@@ -1091,6 +1343,14 @@ class CharRow(QWidget):
 CHART_SERIES = ["#3987e5", "#008300", "#d55181", "#c98500",
                 "#199e70", "#d95926", "#9085e9", "#e66767"]
 CHART_OTHER = "#6d6f78"
+# Time-in-state buckets (engine key, display label, color). Colors match the
+# app's fill palette: mining green, idle amber, full red, offline grey.
+ACTIVITY_STATES = [
+    ("mining",  "Mining",  "#23a55a"),
+    ("idle",    "Idle",    "#f0b232"),
+    ("full",    "Full",    "#f23f43"),
+    ("offline", "Offline", "#6d6f78"),
+]
 CHART_SURFACE = "#313338"
 CHART_GRID = "#3f4147"
 CHART_TEXT = "#dbdee1"
@@ -1135,16 +1395,20 @@ class LedgerChart(QWidget):
         self.values: dict = {}             # day -> {char: value}
         self.labels: list[str] = []
         self.unit = "m³"
+        self.color_map: dict = {}          # optional fixed series -> color
         self.setMouseTracking(True)
         self.setMinimumHeight(260)
         self._hit: list[tuple] = []        # (QRect, char, day, value)
 
-    def set_data(self, days, series, values, unit, labels=None):
+    def set_data(self, days, series, values, unit, labels=None, color_map=None):
         self.days, self.series, self.values, self.unit = days, series, values, unit
         self.labels = labels or [d[5:] for d in days]  # default MM.DD
+        self.color_map = color_map or {}
         self.update()
 
     def color_for(self, char: str) -> str:
+        if char in self.color_map:
+            return self.color_map[char]
         try:
             i = self.series.index(char)
         except ValueError:
@@ -1258,6 +1522,9 @@ class LedgerDialog(DarkDialog):
         if main.settings["privacy_mode"]:   # stable aliases across all history
             main.seed_aliases(c for day in main.engine.ledger["days"].values()
                               for c in day)
+            main.seed_aliases(
+                c for day in main.engine.ledger.get("activity", {}).values()
+                for c in day)
         from PySide6.QtWidgets import QComboBox, QTreeWidget
 
         self.day_combo = QComboBox()
@@ -1319,16 +1586,62 @@ class LedgerDialog(DarkDialog):
         self.chart = LedgerChart()
         tlay.addWidget(self.chart, 1)
 
+        # Activity tab: per-day time-in-state, plus a stacked-hours trend
+        act_tab = QWidget()
+        aclay = QVBoxLayout(act_tab)
+        adrow = QHBoxLayout()
+        adrow.addWidget(QLabel("Day (EVE/UTC):"))
+        self.act_day_combo = QComboBox()
+        for d in sorted(main.engine.ledger.get("activity", {}), reverse=True):
+            self.act_day_combo.addItem(d)
+        self.act_day_combo.currentTextChanged.connect(
+            lambda *_: self.populate_activity())
+        adrow.addWidget(self.act_day_combo, 1)
+        aclay.addLayout(adrow)
+
+        self.act_tree = QTreeWidget()
+        self.act_tree.setColumnCount(6)
+        self.act_tree.setHeaderLabels(
+            ["Character"] + [lbl for _, lbl, _ in ACTIVITY_STATES] + ["Total"])
+        self.act_tree.setRootIsDecorated(False)
+        aclay.addWidget(self.act_tree, 1)
+
+        acrow = QHBoxLayout()
+        acrow.addWidget(QLabel("Trend range:"))
+        self.act_range_combo = QComboBox()
+        for lbl, days in (("7 days", 7), ("30 days", 30), ("90 days", 90),
+                          ("1 year", 365), ("All", 0)):
+            self.act_range_combo.addItem(lbl, days)
+        self.act_range_combo.setCurrentIndex(1)   # 30 days
+        self.act_range_combo.currentTextChanged.connect(
+            lambda *_: self.update_activity_chart())
+        acrow.addWidget(self.act_range_combo)
+        acrow.addStretch(1)
+        aclay.addLayout(acrow)
+        self.act_chart = LedgerChart()
+        aclay.addWidget(self.act_chart, 1)
+        act_note = QLabel(
+            "Time each pilot spent Mining / Idle / Full / Offline, measured "
+            "while the watcher was running (not reconstructed from old logs). "
+            "Offline needs client detection on; otherwise a logged-off pilot "
+            "counts as Idle.")
+        act_note.setWordWrap(True)
+        act_note.setStyleSheet("color: #949ba4;")
+        aclay.addWidget(act_note)
+
         from PySide6.QtWidgets import QTabWidget
         tabs = QTabWidget()
         tabs.addTab(day_tab, "Day detail")
         tabs.addTab(trend_tab, "Trend")
+        tabs.addTab(act_tab, "Activity")
 
         lay = QVBoxLayout(self)
         lay.addWidget(tabs, 1)
         lay.addWidget(self.status)
         lay.addWidget(bb)
-        self.resize(680, 520)
+        # taller by default: the Activity tab stacks a table AND a chart, so
+        # 520 clipped the chart. This fits both without scrolling.
+        self.resize(680, 720)
 
         # ISK uses each day's FROZEN price snapshot (the "Compressed <ore>"
         # market price, since raw ore isn't sold) so priced days keep their
@@ -1350,6 +1663,8 @@ class LedgerDialog(DarkDialog):
                 self._poll.start(500)
         self.populate()
         self.update_chart()
+        self.populate_activity()
+        self.update_activity_chart()
 
     def _today_price(self, ore: str):
         key = "Compressed " + ore
@@ -1568,6 +1883,72 @@ class LedgerDialog(DarkDialog):
         elif not self.main.prices.error:
             self.status.setText("")
 
+    def populate_activity(self):
+        from PySide6.QtWidgets import QTreeWidgetItem
+        self.act_tree.clear()
+        day = self.act_day_combo.currentText()
+        data = self.main.engine.ledger.get("activity", {}).get(day, {})
+        keys = [k for k, _, _ in ACTIVITY_STATES]
+        totals = {k: 0.0 for k in keys}
+        for char in sorted(data, key=lambda c: c.lower()):
+            st = data[char]
+            row_total = 0.0
+            cells = [self.main.disp(char)]
+            for k in keys:
+                v = float(st.get(k, 0.0))
+                row_total += v
+                totals[k] += v
+                cells.append(fmt_dur(v) if v else "-")
+            cells.append(fmt_dur(row_total))
+            item = QTreeWidgetItem(cells)
+            item.setFont(0, bold_font(item.font(0)))
+            self.act_tree.addTopLevelItem(item)
+        grand = sum(totals.values())
+        tot = QTreeWidgetItem(
+            ["TOTAL"] + [fmt_dur(totals[k]) if totals[k] else "-" for k in keys]
+            + [fmt_dur(grand) if grand else "-"])
+        f = bold_font(tot.font(0))
+        for col in range(6):
+            tot.setFont(col, f)
+        self.act_tree.addTopLevelItem(tot)
+        for col in range(6):
+            self.act_tree.resizeColumnToContents(col)
+
+    def update_activity_chart(self):
+        act = self.main.engine.ledger.get("activity", {})
+        days_all = sorted(act)
+        span_days = int(self.act_range_combo.currentData())
+        if span_days and days_all:
+            from datetime import date, timedelta
+            y, m, d = (int(x) for x in days_all[-1].split("."))
+            cutoff = (date(y, m, d) - timedelta(days=span_days - 1)).strftime(
+                "%Y.%m.%d")
+            day_keys = [d for d in days_all if d >= cutoff]
+        else:
+            day_keys = days_all
+
+        n = len(day_keys)
+        grp = "day" if n <= 31 else ("week" if n <= 183 else "month")
+        series = [lbl for _, lbl, _ in ACTIVITY_STATES]
+        color_map = {lbl: col for _, lbl, col in ACTIVITY_STATES}
+
+        values: dict = {}
+        labels: dict = {}
+        order: list = []
+        for day in day_keys:
+            bkey, blab = self._bucket(day, grp)
+            if bkey not in values:
+                values[bkey] = {lbl: 0.0 for lbl in series}
+                labels[bkey] = blab
+                order.append(bkey)
+            per = values[bkey]
+            for st in act[day].values():
+                for key, lbl, _ in ACTIVITY_STATES:
+                    per[lbl] += float(st.get(key, 0.0)) / 3600.0  # -> hours
+        self.act_chart.set_data(order, series, values, "h",
+                                labels=[labels[k] for k in order],
+                                color_map=color_map)
+
 
 # ---------------------------------------------------------------------------
 # Settings dialog
@@ -1655,6 +2036,140 @@ class OreHoldInfoDialog(DarkDialog):
             self.chosen = float(it.text(1 if base else 2).replace(",", ""))
             self.accept()
 
+
+class ScanPasteDialog(DarkDialog):
+    """Paste survey-scanner output, pick the rock being mined, arm a countdown.
+
+    The rock is auto-proposed as the nearest one whose ore matches what the
+    pilot is mining (spec D2) and the pilot from the last-focused client
+    (spec D3). Both are dropdowns: the guess is visible, so being wrong is
+    cheap.
+    """
+
+    def __init__(self, main: "MainWindow", preselect_pilot: str | None = None):
+        super().__init__(main)
+        self.main = main
+        self.rows: list = []
+        self.setWindowTitle("Paste survey scan")
+        self.resize(560, 520)
+
+        self.paste = QPlainTextEdit()
+        self.paste.setPlaceholderText(
+            "Select all rows in the survey scanner window, copy, paste here.")
+        self.paste.textChanged.connect(self.reparse)
+
+        self.pilot = QComboBox()
+        self.pilot.addItem("- select pilot -", None)
+        for name in sorted(main.engine.chars):
+            self.pilot.addItem(name, name)
+        guess = preselect_pilot or main.guess_scan_pilot()
+        if guess:
+            i = self.pilot.findData(guess)
+            if i >= 0:
+                self.pilot.setCurrentIndex(i)
+        self.pilot.currentIndexChanged.connect(lambda *_: self.preselect_rock())
+
+        self.rock = QComboBox()
+        self.rock.currentIndexChanged.connect(lambda *_: self.check_match())
+        self.mismatch = QLabel("")
+        self.mismatch.setWordWrap(True)
+        self.mismatch.setStyleSheet("color: #f0b232; font-size: 12px;")
+        self.mismatch.setVisible(False)
+        self.warn = QLabel("")
+        self.warn.setWordWrap(True)
+        self.warn.setStyleSheet("color: #f0b232;")
+
+        self.ok = QPushButton("Track this rock")
+        self.ok.clicked.connect(self.accept_target)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.ok)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Survey scanner results:"))
+        lay.addWidget(self.paste, 1)
+        lay.addWidget(self.warn)
+        lay.addWidget(QLabel("Pilot:"))
+        lay.addWidget(self.pilot)
+        lay.addWidget(QLabel("Rock being mined:"))
+        lay.addWidget(self.rock)
+        lay.addWidget(self.mismatch)
+        lay.addLayout(buttons)
+        self.reparse()
+
+    def reparse(self):
+        text = self.paste.toPlainText()
+        self.rows, warnings = parse_scan(text, self.main.engine.table)
+        self.rock.clear()
+        # nearest first: the locked rock is the close one (spec F5)
+        for r in sorted(self.rows, key=lambda r: r.distance_m):
+            dist = (f"{r.distance_m:,.0f} m" if r.distance_m < 1000
+                    else f"{r.distance_m / 1000:,.0f} km")
+            self.rock.addItem(f"{r.ore} · {r.units:,} units · {dist}", r)
+        self.preselect_rock()
+        if warnings:
+            shown = warnings[:3]
+            more = (f" (+{len(warnings) - 3} more)" if len(warnings) > 3 else "")
+            self.warn.setText(" ".join(shown) + more)
+        else:
+            self.warn.setText("")
+        self.ok.setEnabled(bool(self.rows))
+
+    def mining_ore(self) -> str | None:
+        """What the selected pilot is ticking right now, per the gamelog."""
+        who = self.pilot.currentData()
+        c = self.main.engine.chars.get(who) if who else None
+        return c.mining_ore() if c else None
+
+    def preselect_rock(self):
+        """Nearest rock whose ore matches what this pilot is mining."""
+        ore = self.mining_ore()
+        if ore and self.rows:
+            for i in range(self.rock.count()):
+                row = self.rock.itemData(i)
+                if row is not None and row.ore == ore:
+                    self.rock.setCurrentIndex(i)   # list is nearest-first
+                    break
+        self.check_match()
+
+    def check_match(self):
+        """Flag a rock whose ore is not the one this pilot is mining.
+
+        Tracking the wrong rock fails silently - no tick ever matches it, so
+        the countdown just sits at its scanned figure looking healthy. The
+        gamelog names the ore on every tick, so this is checkable, and the
+        moment to say so is before the rock is armed, not an hour later.
+        """
+        row = self.rock.currentData()
+        ore = self.mining_ore()
+        if row is None or not ore or row.ore == ore:
+            self.mismatch.setVisible(False)
+            return
+        self.mismatch.setText(
+            f"⚠ This pilot is mining {ore}, not {row.ore}. Tracking a rock "
+            f"they are not shooting will never count down - pick the "
+            f"{ore} rock they have locked, unless you are about to switch.")
+        self.mismatch.setVisible(True)
+
+    def accept_target(self):
+        who = self.pilot.currentData()
+        row = self.rock.currentData()
+        if not who:
+            self.warn.setText("Pick which pilot this scan came from.")
+            return
+        if row is None:
+            self.warn.setText("Pick the rock being mined.")
+            return
+        self.main.engine.set_target(who, ore=row.ore, units=row.units,
+                                    distance_m=row.distance_m)
+        self.main.refresh()
+        self.accept()
+
+
 class SettingsDialog(DarkDialog):
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
@@ -1705,6 +2220,10 @@ class SettingsDialog(DarkDialog):
         self.idle_min.setSuffix(" min")
         self.idle_min.setValue(float(settings["idle_alert_min"]))
 
+        self.allclear = QCheckBox("Also send an all-clear (green) note when an "
+                                  "issue resolves (mining resumes, hold back "
+                                  "to safe)")
+        self.allclear.setChecked(bool(settings["allclear_enabled"]))
         self.combat_on = QCheckBox("Alert when a pilot is attacked by a PLAYER "
                                    "(NPC rats never alert)")
         self.combat_on.setChecked(bool(settings["combat_alert_enabled"]))
@@ -1788,6 +2307,13 @@ class SettingsDialog(DarkDialog):
         self.ledger_prices.setChecked(bool(settings["ledger_fetch_prices"]))
         self.ledger_backfill = QCheckBox("Value unpriced past days at today's "
                                          "price (marked as estimated)")
+        self.sde_update = QPushButton("Update ore data from SDE")
+        self.sde_update.setToolTip(
+            "Download the latest published ore, ice, gas, and variant volumes")
+        self.sde_status = QLabel(
+            f"Runtime catalog: {config_dir() / 'sde_volumes.json'}")
+        self.sde_status.setWordWrap(True)
+        self.sde_status.setStyleSheet("color: #949ba4; font-size: 11px;")
         self.ledger_backfill.setChecked(bool(settings["ledger_backfill_prices"]))
         self.upd_check = QCheckBox("Check GitHub for app updates (daily, from "
                                    + DEFAULT_UPDATE_REPO + ")")
@@ -1817,6 +2343,8 @@ class SettingsDialog(DarkDialog):
         gf.addRow(self.ledger_on)
         gf.addRow(self.ledger_prices)
         gf.addRow(self.ledger_backfill)
+        gf.addRow(self.sde_update)
+        gf.addRow(self.sde_status)
         gf.addRow(self.upd_check)
         gf.addRow(self.dbg)
         gf.addRow(self.open_log)
@@ -1827,6 +2355,7 @@ class SettingsDialog(DarkDialog):
         af.addRow("Min. time between alerts:", self.interval)
         af.addRow(self.idle_on)
         af.addRow("Idle after:", self.idle_min)
+        af.addRow(self.allclear)
         af.addRow(self.combat_on)
         af.addRow("Combat re-alert:", self.combat_cd)
         af.addRow(self.drone_on)
@@ -1860,9 +2389,16 @@ class SettingsDialog(DarkDialog):
         bb.rejected.connect(self.reject)
 
         notice = QLabel(
+            'Ore Hold Watcher © 2026 LittlePhish - free software under the GNU '
+            'GPL v3 or later; comes with ABSOLUTELY NO WARRANTY. '
+            '<a href="https://www.gnu.org/licenses/gpl-3.0.html" '
+            'style="color:#6d6f78;">License</a> · '
+            '<a href="https://github.com/littlephish/ore-hold-watcher" '
+            'style="color:#6d6f78;">Source</a><br>'
             'EVE Online and the EVE logo are trademarks of CCP hf. This app '
             'is not affiliated with or endorsed by CCP. '
             '© CCP hf. All rights reserved.')
+        notice.setOpenExternalLinks(True)
         notice.setWordWrap(True)
         notice.setStyleSheet("color: #6d6f78; font-size: 10px;")
 
@@ -1890,6 +2426,7 @@ class SettingsDialog(DarkDialog):
         self.s["alert_interval_min"] = self.interval.value()
         self.s["idle_alert_enabled"] = self.idle_on.isChecked()
         self.s["idle_alert_min"] = self.idle_min.value()
+        self.s["allclear_enabled"] = self.allclear.isChecked()
         self.s["combat_alert_enabled"] = self.combat_on.isChecked()
         self.s["combat_alert_cooldown_s"] = self.combat_cd.value()
         self.s["drone_alert_enabled"] = self.drone_on.isChecked()
@@ -1960,12 +2497,21 @@ class MainWindow(QMainWindow):
             combat_enabled=bool(self.settings["combat_alert_enabled"]),
             ledger_path=config_dir() / "ledger.json",
             ledger_enabled=bool(self.settings["ledger_enabled"]),
+            sde_paths=sde_catalog_paths(),
         )
         self.engine.drone_enabled = bool(self.settings["drone_alert_enabled"])
         self.prices = PriceService()
         self.clients = ClientWatcher(self.settings["eve_process_names"])
+        # character -> scan_ts already warned about; re-arms on re-anchor
+        self._rock_warned: dict[str, str] = {}
         self._last_client_scan = 0.0
+        # scanned rocks restored from disk are provisional until the first
+        # poll has replayed the logs and we can see whether they are still
+        # being mined (see Engine.drop_stale_targets)
+        self._rock_startup_swept = False
         self._last_price_check = 0.0
+        self._last_activity_ts = 0.0    # wall-clock of last time-in-state accrual
+        self._last_activity_save = 0.0  # throttle ledger writes for activity
 
         self.setWindowTitle(APP_NAME)
         try:
@@ -2024,6 +2570,15 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
         self.rows: dict[str, tuple[QWidget, CharRow]] = {}
+        # refresh throttling / repaint caches: the poll tick runs every
+        # poll_seconds for alerting, but the (much heavier) visual refresh is
+        # rate-limited and only repaints tray/rows when values actually change
+        self._last_refresh = 0.0
+        self._tray_icon_key = None    # last (pct, rock_frac) painted
+        self._gauge_pixmap = None     # cached gauge; repainted only on pct change
+        self._tray_tip = ""
+        self._win_title = ""
+        self._applied_order: list | None = None  # row order last laid out
 
         # Tray
         self.tray = QSystemTrayIcon(make_tray_icon(0), self)
@@ -2031,6 +2586,8 @@ class MainWindow(QMainWindow):
         menu = QMenu()
         menu.addAction("Show / Hide", self.toggle_visible)
         menu.addAction("Recalculate from logs", self.recalculate)
+        menu.addAction("Paste survey scan…",
+                       lambda: ScanPasteDialog(self).exec())
         menu.addAction("Reset all holds to 0", self.reset_all)
         menu.addAction("Check for updates", self.manual_update_check)
         menu.addSeparator()
@@ -2054,6 +2611,9 @@ class MainWindow(QMainWindow):
         self._last_alert_ts = 0.0     # rate limiter for threshold alerts
         self._combat_alerted: dict[str, float] = {}  # per-pilot combat cooldown
         self._drone_alerted: dict[str, float] = {}   # per-pilot drone cooldown
+        # pilots with an open problem, awaiting an all-clear:
+        self._pending_resume: set[str] = set()  # idle/drone alerted; clears on mining
+        self._pending_safe: set[str] = set()    # threshold/full; clears below re-arm
         self._alert_pending = False
         self._pending_title = ""
 
@@ -2122,6 +2682,10 @@ class MainWindow(QMainWindow):
         style_titlebar(self)
         # re-assert whenever the window (re)appears, e.g. from the tray
         QTimer.singleShot(0, self.apply_on_top)
+        # rows/status are skipped while hidden, so resync them now the window
+        # is visible again
+        self._applied_order = None       # force a re-layout on next refresh
+        QTimer.singleShot(0, self.refresh)
 
     def toggle_visible(self):
         if self.isVisible():
@@ -2142,11 +2706,19 @@ class MainWindow(QMainWindow):
 
     def quit(self):
         self.engine.save_state()
+        if self.settings["ledger_enabled"]:
+            self.engine.save_ledger()   # persist the last unsaved activity slice
         self.tray.hide()
         QApplication.quit()
 
     # -- notifications --------------------------------------------------------
     def notify(self, title: str, body: str, payload: dict | None = None):
+        self.notifier.alert(title, body, payload)
+
+    def send_allclear(self, title: str):
+        """A green 'resolved' notification through every enabled method."""
+        body, payload = self.fleet_summary()
+        payload["allclear"] = True
         self.notifier.alert(title, body, payload)
 
     def fleet_summary(self) -> tuple[str, dict]:
@@ -2254,6 +2826,42 @@ class MainWindow(QMainWindow):
         self.engine.reset(name)
         self.refresh()
 
+    def _rock_alert(self, c):
+        """Soft, local-only warning that a rock is about to run dry (D6).
+
+        Strip miners get no popped-rock line in the log at all (spec F3), so
+        without this a minimised window means no warning. Deliberately NOT
+        routed through Notifier.alert(), which fans out to popup, sound,
+        webhook and ntfy - this alert never leaves the machine.
+        """
+        if not c.target:
+            self._rock_warned.pop(c.name, None)
+            return
+        eta = c.rock_eta_s()
+        if eta is None or eta > CharRow.ROCK_WARN_S:
+            return
+        if self._rock_warned.get(c.name) == c.target.scan_ts:
+            return
+        self._rock_warned[c.name] = c.target.scan_ts
+        if self.settings["notify_overlay"]:
+            self.notifier.overlay.show_alert(
+                f"{self.disp(c.name)}: {c.target.ore} rock nearly dry")
+
+    def guess_scan_pilot(self) -> str | None:
+        """Best guess at which pilot a pasted scan belongs to (spec D3).
+
+        Last-focused EVE client first; if that is unknown or stale, fall back
+        to the only pilot currently mining. Ambiguity returns None and the
+        dialog leaves its dropdown unselected rather than guessing wrong -
+        misattribution corrupts two pilots' countdowns at once.
+        """
+        who = getattr(self.clients, "last_focused", None)
+        if who and who in self.engine.chars:
+            return who
+        active = [c.name for c in self.engine.chars.values()
+                  if c.mining_rate_m3_min() > 0]
+        return active[0] if len(active) == 1 else None
+
     def calibrate_char(self, name: str):
         c = self.engine.char(name)
         val, ok = QInputDialog.getDouble(
@@ -2311,6 +2919,56 @@ class MainWindow(QMainWindow):
         self.engine.set_capacity(name, val)
         self.refresh()
 
+    def update_sde_catalog(self, dialog: SettingsDialog):
+        """Refresh the user catalog without blocking the Settings dialog."""
+        if getattr(self, "_sde_busy", False):
+            return
+        self._sde_busy = True
+        self._sde_error = None
+        self._sde_count = 0
+        dialog.sde_update.setEnabled(False)
+        dialog.sde_update.setText("Updating SDE data...")
+
+        def worker():
+            try:
+                self._sde_count = update_catalog(
+                    config_dir() / "sde_volumes.json")
+            except Exception as exc:
+                self._sde_error = str(exc)
+            finally:
+                self._sde_busy = False
+
+        threading.Thread(target=worker, daemon=True).start()
+        timer = QTimer(dialog)
+        dialog._sde_timer = timer
+
+        def finish():
+            if self._sde_busy:
+                return
+            timer.stop()
+            dialog.sde_update.setEnabled(True)
+            dialog.sde_update.setText("Update ore data from SDE")
+            if self._sde_error:
+                dialog.sde_status.setText(
+                    f"SDE update failed; existing catalog kept:\n"
+                    f"{config_dir() / 'sde_volumes.json'}")
+                QMessageBox.warning(dialog, "SDE update failed",
+                                    "The existing ore data was kept.\n\n" +
+                                    self._sde_error)
+                return
+            self.engine.reload_sde(sde_catalog_paths())
+            dialog.sde_update.setToolTip(
+                f"Updated {self._sde_count:,} published resource volumes")
+            dialog.sde_status.setText(
+                f"Updated {self._sde_count:,} volumes; runtime catalog:\n"
+                f"{config_dir() / 'sde_volumes.json'}")
+            self.status.setText(
+                f"SDE data updated: {self._sde_count:,} resource volumes")
+            self.refresh()
+
+        timer.timeout.connect(finish)
+        timer.start(250)
+
     def remove_char(self, name: str):
         self.engine.remove(name)
         self.refresh()
@@ -2323,6 +2981,7 @@ class MainWindow(QMainWindow):
             body, payload = self.fleet_summary()  # real current fleet state
             self.notifier.alert("⚠ Test alert - Ore Hold Watcher", body, payload)
         dlg.test_btn.clicked.connect(send_test)
+        dlg.sde_update.clicked.connect(lambda: self.update_sde_catalog(dlg))
 
         if dlg.exec() == QDialog.Accepted:
             dlg.apply()
@@ -2377,10 +3036,23 @@ class MainWindow(QMainWindow):
 
     # -- updates -----------------------------------------------------------------
     def manual_update_check(self):
+        if is_packaged():
+            QMessageBox.information(
+                self, "Updates", "This is the MSIX build - updates are managed "
+                "by Windows (App Installer / reinstall the package), so the "
+                "in-app updater is disabled.")
+            return
         if not is_frozen():
             QMessageBox.information(
                 self, "Updates", "Running from source - update by pulling "
                 "the repo. Auto-update only applies to the built exe.")
+            return
+        if not can_write_install_dir():
+            QMessageBox.information(
+                self, "Updates", "This install lives in a folder that needs "
+                "administrator rights to change, so the in-app updater can't "
+                "apply updates here. Download the latest release and reinstall "
+                "to update.")
             return
         self.updater.check_async(manual=True)
 
@@ -2442,6 +3114,39 @@ class MainWindow(QMainWindow):
             self._last_update_check = time.time()
             u.check_async()
 
+    # -- time-in-state accounting -----------------------------------------------
+    def _accrue_activity(self, is_closed) -> None:
+        """Add the elapsed wall-clock since the last tick to each tracked
+        pilot's current-state bucket for today (UTC). State priority:
+        offline (client closed) > full > mining > idle. Only counts normal
+        tick gaps - a long gap (sleep/stall) is skipped rather than guessed,
+        and the whole thing is off unless the ledger is enabled."""
+        if not self.settings["ledger_enabled"]:
+            self._last_activity_ts = 0.0     # so resume doesn't dump a big gap
+            return
+        now = time.time()
+        dt = now - self._last_activity_ts
+        self._last_activity_ts = now
+        poll_s = max(1.0, float(self.settings["poll_seconds"]))
+        if not (0 < dt <= poll_s * 3 + 1):   # first tick / abnormal gap
+            return
+        day = time.strftime("%Y.%m.%d", time.gmtime())
+        recorded = False
+        for c in self.engine.chars.values():
+            if is_closed(c.name):
+                state = "offline"
+            elif c.est_m3 >= c.capacity * 0.999:
+                state = "full"
+            elif c.mining_rate_m3_min(now) > 0:
+                state = "mining"
+            else:
+                state = "idle"
+            if self.engine.activity_add(c.name, state, dt, day):
+                recorded = True
+        if recorded and now - self._last_activity_save > 60:
+            self._last_activity_save = now
+            self.engine.save_ledger()
+
     # -- main loop --------------------------------------------------------------
     def tick(self):
         events = self.engine.poll()
@@ -2464,6 +3169,13 @@ class MainWindow(QMainWindow):
             if (isinstance(ev, MiningEvent) and
                     now_utc - ts_to_epoch(ev.ts) < idle_after):
                 self.engine.char(ev.character).idle_notified = False
+                # all-clear: this pilot was flagged idle/drone-stopped and is
+                # now mining again
+                if (self.settings["allclear_enabled"] and
+                        ev.character in self._pending_resume):
+                    self._pending_resume.discard(ev.character)
+                    self.send_allclear(
+                        f"✅ {self.disp(ev.character)} - mining resumed")
             # PLAYER aggression: urgent, bypasses the digest rate limiter.
             # NPC rats (is_player=False) never alert. The 2-minute liveness
             # guard keeps startup replay of old fights silent.
@@ -2490,13 +3202,16 @@ class MainWindow(QMainWindow):
                 cd = float(self.settings["drone_alert_cooldown_s"])
                 if now_utc - self._drone_alerted.get(ev.character, 0.0) >= cd:
                     self._drone_alerted[ev.character] = now_utc
+                    self._pending_resume.add(ev.character)
+                    what = ev.module or "mining drone(s)"
                     self.request_alert(
-                        f"🛑 {ev.character} - mining drone(s) stopped "
+                        f"🛑 {ev.character} - {what} stopped "
                         f"(asteroid depleted)")
             if isinstance(ev, HoldFullEvent):
                 c = self.engine.char(ev.character)
                 if not c.notified:
                     c.notified = True
+                    self._pending_safe.add(ev.character)
                     self.request_alert(f"⚠ {ev.character} - ore hold FULL")
             elif isinstance(ev, UnknownOreEvent):
                 if ev.ore not in self.warned_ores:
@@ -2504,13 +3219,36 @@ class MainWindow(QMainWindow):
                     self.notify("Unknown ore type",
                                 f"'{ev.ore}' isn't in the volume table - add it to "
                                 f"ores_override.json (Settings folder) so it counts.")
+        # --- scanned-rock invalidation ------------------------------------
+        # A closed client is a blind spot: docking, ship swaps and belt hops
+        # all happen unseen, so the rock stops being provable the moment the
+        # client goes away. Runs every tick, so it catches both a client that
+        # closed while we watched and one already gone at startup.
+        for c in list(self.engine.chars.values()):
+            if c.target and is_closed(c.name):
+                self.engine.client_closed(c.name)
+        # First tick only: the state file restored these rocks, but the replay
+        # above is what decides whether they are still real (spec D4).
+        if not self._rock_startup_swept:
+            self._rock_startup_swept = True
+            for name in self.engine.drop_stale_targets(now_utc):
+                log.info("startup: dropped stale rock for %s", name)
         # threshold crossings / re-arm
         for c in self.engine.chars.values():
             if c.pct >= threshold and not c.notified:
                 c.notified = True
+                self._pending_safe.add(c.name)
                 self.request_alert(f"⚠ {c.name} - {c.pct:.1f}% full")
             elif c.pct < rearm and c.notified:
                 c.notified = False
+                # all-clear: hold dropped back to a safe level (unloaded,
+                # compressed, or reset)
+                if (self.settings["allclear_enabled"] and
+                        c.name in self._pending_safe):
+                    self._pending_safe.discard(c.name)
+                    self.send_allclear(
+                        f"✅ {self.disp(c.name)} - hold back to safe "
+                        f"({c.pct:.1f}%)")
         # idle detection: armed pilots whose ticks stopped for idle_after.
         # A CLOSED client is not idle: it disarms silently and never fires
         # the idle alert (re-arms automatically on the next live tick).
@@ -2524,19 +3262,76 @@ class MainWindow(QMainWindow):
                 gap = now_utc - c.rate_events[-1][0]
                 if gap >= idle_after:
                     c.idle_notified = True   # fire once until mining resumes
+                    self._pending_resume.add(c.name)
                     self.request_alert(
                         f"⏸ {c.name} - no ore ticks for {int(gap // 60)} min")
+        self._accrue_activity(is_closed)
         self._flush_alert()          # send any alert the rate limiter held back
         self._check_downtime_close()
         self._maintain_prices()
         self._pump_updates()
-        self.refresh()
+        # Decouple the visual refresh from the poll tick: repaint promptly when
+        # something actually happened (mining events), otherwise only every few
+        # seconds - and rarely while hidden in the tray, where nothing is shown.
+        min_gap = 2.0 if self.isVisible() else 10.0
+        if events or now_utc - self._last_refresh >= min_gap:
+            self._last_refresh = now_utc
+            self.refresh()
 
     def refresh(self):
         chars = sorted(self.engine.chars.values(),
                        key=lambda c: c.pct, reverse=True)
         if self.settings["privacy_mode"]:   # stable Pilot 1..N by real name
             self.seed_aliases(c.name for c in chars)
+
+        # --- tray gauge / tooltip / title: this path runs even while hidden,
+        # so only touch the shell when the displayed value actually changed.
+        # Repainting the icon and calling setIcon (a Win32 shell notify) every
+        # tick was the bulk of the idle CPU. ---
+        max_pct = max((c.pct for c in chars), default=0.0)
+        # inner ring: the rock that runs dry first, anywhere in the fleet
+        rock = fastest_rock(chars)
+        # Quantized to 2% steps and folded into the cache key, so the rock
+        # ring costs at most ~50 repaints over a rock's whole life instead of
+        # one per tick. Paint the QUANTIZED value so pixels match the key.
+        rock_key = None if rock is None else round(rock.fraction * 50) / 50
+        icon_key = (round(min(max_pct, 100.0), 1), rock_key)
+        if icon_key != self._tray_icon_key:
+            self._tray_icon_key = icon_key
+            self._gauge_pixmap = make_gauge_pixmap(max_pct, rock_key)  # repaint
+            self.tray.setIcon(QIcon(self._gauge_pixmap))     # tray: shell call
+        # Windows 11's taskbar button ignores a repeated identical QIcon and
+        # drops the icon when the native window is recreated (always-on-top
+        # toggle). Push a FRESH QIcon from the cached pixmap every visible
+        # refresh so the taskbar actually repaints - cheap (no re-paint), and
+        # only while the window is shown.
+        if self._gauge_pixmap is not None and self.isVisible():
+            self.setWindowIcon(QIcon(self._gauge_pixmap))
+        title = f"{APP_NAME} - {max_pct:.0f}%" if chars else APP_NAME
+        if title != self._win_title:
+            self._win_title = title
+            self.setWindowTitle(title)
+
+        def tip_line(c):
+            eta = c.eta_full_s()
+            return (f"{c.pct:.1f}%  {self.disp(c.name)}" +
+                    (f"  ({fmt_eta(eta)})" if eta else ""))
+        tip = "\n".join(tip_line(c) for c in chars[:8]) or APP_NAME
+        # A blue ring on its own is a riddle; the tooltip says what it means.
+        if rock:
+            eta_txt = fmt_eta(rock.eta_s) if rock.eta_s else "measuring…"
+            tip += (f"\n⛏ {rock.ore} · {rock.remaining:,} left · dry in "
+                    f"{eta_txt} · {self.disp(rock.character)}")
+        if tip != self._tray_tip:
+            self._tray_tip = tip
+            self.tray.setToolTip(tip)
+
+        # --- everything below is visual detail that's pointless while the
+        # window is hidden in the tray; skip it entirely. showEvent forces a
+        # full refresh when the window reappears. ---
+        if not self.isVisible():
+            return
+
         wanted = [c.name for c in chars]
         # drop rows for removed chars
         for name in list(self.rows):
@@ -2544,7 +3339,9 @@ class MainWindow(QMainWindow):
                 frame, _ = self.rows.pop(name)
                 frame.setParent(None)
                 frame.deleteLater()
-        # (re)build rows in order
+                self._applied_order = None   # layout changed -> force reorder
+        # (re)build rows, only re-laying them out when the order actually changed
+        reorder = wanted != self._applied_order
         for i, c in enumerate(chars):
             if c.name not in self.rows:
                 from PySide6.QtWidgets import QFrame
@@ -2555,9 +3352,11 @@ class MainWindow(QMainWindow):
                 row = CharRow(self, c.name)
                 lay.addWidget(row)
                 self.rows[c.name] = (frame, row)
+                reorder = True
             frame, row = self.rows[c.name]
-            self.rows_box.removeWidget(frame)
-            self.rows_box.insertWidget(i, frame)
+            if reorder:
+                self.rows_box.removeWidget(frame)
+                self.rows_box.insertWidget(i, frame)
             closed = (bool(self.settings["client_watch_enabled"]) and
                       self.clients.ready and c.name not in self.clients.online)
             if closed:
@@ -2572,6 +3371,12 @@ class MainWindow(QMainWindow):
                 arm = "standby"
             row.lbl.setText(self.disp(c.name))
             row.update_state(c.est_m3, c.capacity, c.eta_full_s(), arm)
+            row.update_rock(c.target, c.rock_remaining(), c.rock_eta_s(),
+                            self.disp(c.name), c.rock_status(),
+                            c.mining_ore())
+            self._rock_alert(c)
+        if reorder:
+            self._applied_order = wanted
 
         # who fills up first at current mining rates?
         etas = [(c.eta_full_s(), c) for c in chars]
@@ -2600,20 +3405,21 @@ class MainWindow(QMainWindow):
             "color: #f0b232;" if (not dir_ok or s["unmatched_mining"])
             else "color: #949ba4;")
 
-        max_pct = max((c.pct for c in chars), default=0.0)
-        gauge = make_tray_icon(max_pct)
-        self.tray.setIcon(gauge)
-        self.setWindowIcon(gauge)  # taskbar button shows the same live gauge
-        if chars:
-            self.setWindowTitle(f"{APP_NAME} - {max_pct:.0f}%")
-        else:
-            self.setWindowTitle(APP_NAME)
-        def tip_line(c):
-            eta = c.eta_full_s()
-            return (f"{c.pct:.1f}%  {self.disp(c.name)}" +
-                    (f"  ({fmt_eta(eta)})" if eta else ""))
-        tip = "\n".join(tip_line(c) for c in chars[:8]) or APP_NAME
-        self.tray.setToolTip(tip)
+
+def set_app_user_model_id() -> None:
+    """Give the process a stable taskbar identity. Without this Windows guesses
+    it from whoever launched us, so a build relaunched by the updater lands
+    under a different identity than one started from the Start menu - and in
+    that state Win11 shows the static exe icon on the taskbar instead of the
+    live gauge. Must run before any window is created."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            ctypes.c_wchar_p(APP_USER_MODEL_ID))
+    except Exception as e:
+        log.debug("set AppUserModelID failed: %s", e)
 
 
 def main():
@@ -2626,6 +3432,11 @@ def main():
     log.info("=== Ore Hold Watcher starting (user=%s) ===", os.environ.get(
         "USERNAME") or os.environ.get("USER") or "?")
     log.info("config dir: %s", config_dir())
+    sde_paths = sde_catalog_paths()
+    log.info("SDE volume catalog path(s): %s",
+             ", ".join(str(p) for p in sde_paths)
+             if sde_paths else "none; using built-in volumes")
+    set_app_user_model_id()   # stable taskbar identity, before any window
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(APP_NAME)

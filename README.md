@@ -18,6 +18,21 @@ top of that:
   rate-limited, listing every pilot.
 - Compression tracked automatically; time-to-full ETA per pilot from each
   pilot's own mining rate.
+- Survey-scan rock countdown: paste the scanner results and each pilot gets a
+  live "dry in 4m12s" for the rock they're on. It counts mined *and* residue
+  units, so it tracks the rock draining ~25% faster than your hold fills.
+  The rate is measured per mining *cycle* from that pilot's own recent ticks,
+  so if they were already mining that ore the countdown is live immediately;
+  from a cold start it needs about 30 seconds. Track a rock of an ore the
+  pilot isn't actually shooting and the row says "stalled: mining X" instead
+  of a countdown that can never move - the gamelog names the ore on every
+  tick, so this is checked, and the paste dialog warns you up front.
+  Soft on-screen warning only - never sent to Discord or your phone.
+  Scanner distances are measured from the scanning ship, so paste **each
+  miner's own scan** (right-click that pilot's row - it preselects them) and
+  the nearest rock of the ore they're mining is picked automatically. Two
+  pilots in the same belt get different distance columns, which is exactly
+  what tells their rocks apart.
 - Extra alerts (all opt-in): a pilot idle for X minutes, a pilot attacked
   by a player (never NPC rats), a mining drone stopping on a dry rock.
 - Closed-client detection so a logged-off alt never reads as "idle".
@@ -39,14 +54,32 @@ and the folder path is masked.)*
 2. Double-click `run.bat`. The first run creates a virtualenv, installs
    PySide6 and winotify, then launches straight to the tray and window.
 
-## Build a standalone exe
+## Install (Windows)
 
-Double-click `build.bat`. It installs Nuitka into the venv and compiles
-`build\OreHoldWatcher.exe` as a single file with no console window. The
-first build takes several minutes and needs no key presses.
+Grab the latest [release](https://github.com/littlephish/ore-hold-watcher/releases):
+
+- **Installer** - `OreHoldWatcher-<ver>-setup.exe`. Per-user install (no UAC
+  prompt), adds Start-menu/optional desktop shortcuts, and updates itself
+  in-app. Recommended.
+- **Portable zip** - `OreHoldWatcher-<ver>-win64.zip`. Unzip anywhere and run
+  `OreHoldWatcher.exe`; no install. It still self-updates as long as its folder
+  is writable.
+
+Both ship a Nuitka **standalone program folder**, not a single .exe: a onefile
+build unpacks itself to `%TEMP%` and runs from there, which Defender and
+CrowdStrike flag as dropper behaviour. The folder form avoids that and is what
+makes the in-app updater possible.
 
 To start it with Windows: press `Win+R`, type `shell:startup`, and drop a
-shortcut to the exe (or `run.bat`) in that folder.
+shortcut to `OreHoldWatcher.exe` in that folder.
+
+## Build it yourself
+
+Double-click `build.bat`. It installs Nuitka into the venv and compiles a
+standalone folder, then stages `dist\OreHoldWatcher\` plus a portable zip (and
+the installer too, if [Inno Setup](https://jrsoftware.org/isinfo.php) is
+installed - `winget install JRSoftware.InnoSetup`). The first build takes
+several minutes and needs no key presses.
 
 ## How it works
 
@@ -55,6 +88,13 @@ Each mining cycle line is converted from units to m³ using a built-in ore
 volume table. Variants like Concentrated Veldspar resolve to their base
 ore, Compressed ores use compressed volumes, and ice, moon ore, and gas are
 included.
+
+Published ore, ice, gas, and resource variants are also loaded from a compact
+SDE-derived volume catalog. Builds refresh and bundle this catalog so the app
+works offline. To refresh it while running, open Settings and choose **Update
+ore data from SDE**; the existing catalog is kept if the download fails. User
+values in `ores_override.json` still take precedence over SDE and built-in
+values.
 
 The number shown is an estimate accumulated since your last reset, because
 EVE's logs never record unloads. When a hauler empties a hold, right-click
@@ -128,6 +168,13 @@ send real names - this only changes what's on screen.
 
 Colors everywhere mean the same thing: green below 75%, amber 75 to 90%,
 red above 90%.
+
+Blue is a separate channel and never means fill: it is always the survey-scan
+rock countdown. It shows up as a thin bar under a pilot's fill bar, and as an
+inner ring inside the tray/taskbar gauge (that one follows whichever rock in
+the fleet runs dry first - hover the tray for which pilot and which ore). Both
+start full when you paste a scan and drain back toward the start, the mirror
+of the fill bar growing away from it.
 
 ## Daily mining ledger
 
@@ -255,6 +302,14 @@ again, and it never fires at startup for pilots who already stopped before
 the app launched. Use it to catch depleted belts, returned drones, or a
 client that got bumped or disconnected.
 
+An all-clear option (off by default) sends a green "resolved" note through
+the same methods when a problem clears: a pilot that was flagged idle or
+drone-stopped starts mining again ("✅ … mining resumed"), or a hold that
+crossed the threshold/full drops back below the re-arm level after you
+unload, compress, or reset ("✅ … hold back to safe"). On Discord the
+embed is green regardless of the current fill, so a glance at the color
+tells you problem versus resolved.
+
 Each method is a checkbox on the Alerts tab, saved in `settings.json`:
 
 - **Pop-up**: native Windows toast (tray balloon as fallback). Obeys Focus
@@ -338,49 +393,54 @@ emergency-warp handling, which is the point of doing it before shutdown.
 
 ## Auto-update
 
-The built exe updates itself from GitHub, from the fixed repo
-`littlephish/ore-hold-watcher`. Leave "Check GitHub for app updates"
-ticked and it works out of the box. The app checks the latest release
-20 seconds after launch and daily after that; the tray menu also has
-"Check for updates" for an on-demand check. When you accept an update it
-downloads the new exe, waits for this process to fully exit, then swaps
-the file in (retrying briefly if a onefile exe or antivirus still holds a
-lock) and relaunches.
+The installed and portable-zip builds update themselves from GitHub, from the
+fixed repo `littlephish/ore-hold-watcher`. Leave "Check GitHub for app updates"
+ticked and it works out of the box. The app checks the latest release 20
+seconds after launch and daily after that; the tray menu also has "Check for
+updates" for an on-demand check.
 
-When a newer version exists you get a dialog showing both versions with
-three choices: **Update now** downloads the new exe, shows a "restarting"
-notice, then swaps it in and relaunches (your settings and state are
-untouched - they live beside the exe and aren't part of the download);
-**Later** dismisses and asks again next launch; **Skip this version**
-never asks about that version again. A manual "Check for updates" from the
-tray always shows the dialog, even for a version you skipped.
+Because the app ships as a program folder, an update is a **folder swap**, not
+an exe swap: it downloads the new `-win64.zip`, and on your OK a small detached
+PowerShell helper waits for this process to exit, mirrors the new folder over
+the install folder (pruning files old versions left behind but keeping the Inno
+uninstaller), then relaunches. Your settings, state and ledger are untouched -
+they live in `%APPDATA%\OreHoldWatcher`, outside the program folder, so neither
+an update nor an uninstall can disturb them.
 
-Version comparison uses the version stamped into the exe by
-`release.yml`, so it only works for exes built from a tag. Running from
-source? The updater stays out of the way: update with `git pull`.
+When a newer version exists you get a dialog showing both versions with three
+choices: **Update now**, **Later** (asks again next launch), or **Skip this
+version** (never asks about it again). A manual "Check for updates" always shows
+the dialog, even for a skipped version.
+
+Version comparison uses the version stamped into the exe by `release.yml`, so it
+only works for builds made from a tag. The updater turns itself off when it
+can't apply an update: running from source (use `git pull`), running the MSIX
+build (Windows manages that), or when the program folder isn't writable (a
+machine-wide install - reinstall the newer release instead).
 
 ## CI and releases (GitHub)
 
-Push this folder to a GitHub repo and two workflows take over:
+Push this folder to a GitHub repo and the workflows take over:
 
-- `ci.yml` runs the engine tests on Linux for every push and PR, then
-  builds the Windows exe with Nuitka and uploads it as a build artifact.
-- `release.yml` triggers on a version tag, builds a version-stamped exe,
-  and publishes a GitHub Release with `OreHoldWatcher.exe` attached:
+- `ci.yml` runs the engine tests on Linux for every push and PR.
+- `release.yml` triggers on a version tag: it builds a version-stamped Nuitka
+  **standalone** folder and publishes a GitHub Release with both the portable
+  `OreHoldWatcher-<ver>-win64.zip` and the `OreHoldWatcher-<ver>-setup.exe`
+  Inno Setup installer attached:
 
       git tag v1.0.0
       git push origin v1.0.0
 
-Both are non-interactive. The first CI build is slow; later ones reuse the
-Nuitka compilation cache.
+All are non-interactive. The first build is slow; later ones reuse the Nuitka
+compilation cache.
 
 ## Files it writes
 
-Config lives beside the exe (or beside `app.py` when running from source).
-The old `%APPDATA%\OreHoldWatcher\` location is still checked on every
-startup: anything found there and missing here is copied over, and if the
-exe's folder is not writable the app keeps using APPDATA. All of these are
-in `.gitignore`:
+Installed and portable builds keep config in `%APPDATA%\OreHoldWatcher\`,
+outside the program folder, so updates and uninstalls never touch it. Running
+from source it stays portable (beside `app.py`). A one-time migration copies
+config found in the other location on first run, so nothing is lost across the
+move. All of these are in `.gitignore`:
 
 - `settings.json`: log folder, threshold, capacities, alert methods,
   downtime options, and `mining_patterns` (custom regexes with named
@@ -436,9 +496,57 @@ reading gamelogs, that change wins.
 
 ## License
 
-MIT - see [LICENSE](LICENSE) for details. The license covers this app's
-code only; EVE Online and all CCP property remain CCP's, per the notice
-below.
+GNU General Public License v3.0 - see [LICENSE](LICENSE) for the full text.
+In short: this app is free software; you may use, study, share, and modify
+it, but any distributed derivative must also be licensed under GPLv3 and ship
+its source. The license covers this app's code only; EVE Online and all CCP
+property remain CCP's, per the notice below.
+
+One exception: the [`updater/`](updater/) folder is **MIT**, Copyright (c) 2026
+Jammy LLC - see [updater/LICENSE](updater/LICENSE). It is a generic, app-agnostic
+updater reused across Jammy LLC projects and is not part of this app's GPLv3
+code. MIT is GPL-compatible, so distributed builds of Ore Hold Watcher as a whole
+remain GPLv3; the `updater/` sources on their own may be reused under MIT.
+
+Packaged builds carry their notices in the program folder: `LICENSE.txt` (this
+app, GPLv3) and `LICENSE-updater.txt` (`update.exe`, MIT). Both the portable zip
+and the installer include them.
+
+This app bundles Qt (via PySide6, LGPLv3) in its packaged builds. Because the
+build is a plain program folder, the Qt libraries can be replaced by the user
+as LGPLv3 allows; a bundled copy of the Qt license notices is still planned.
+
+## CCP Developer License Agreement
+
+CCP's [Developer License Agreement](https://developers.eveonline.com/license-agreement)
+governs applications that use CCP Tools (ESI, SSO) and Licensed Materials.
+Ore Hold Watcher uses none of those - it reads only the local gamelog text
+files the EVE client writes - so by its own scope clause the agreement does
+not strictly apply here; a log reader is governed by CCP's general EULA and
+Third-Party Policies (covered above). The app nonetheless adheres to the
+Developer License Agreement's substantive terms:
+
+- Non-commercial and non-profit: it is free and open source, sold nothing,
+  and solicits no fees, donations, or ad revenue (Sections 1.13, 4).
+- No prohibited use: no malware, phishing, spam, fraud, or denial-of-service
+  (Section 2.3). It reads only the local player's own logs and transmits
+  nothing except the alerts that player configures to their own webhook or
+  ntfy topic.
+- No misrepresentation: it does not present itself as, or as affiliated
+  with, CCP, and does not combine the EVE logo with its own marks - its icon
+  is an original gauge, not CCP art (Sections 2.7, 7.3).
+- Proprietary notice preserved (Section 7.1), reproduced below.
+
+The one item to use judgment on: a combat alert can name an attacking
+player in a message you send to your own Discord/ntfy. That is transient,
+player-initiated intel to your own channel (the kind of local-intel EVE
+tools have long produced), not systematic tracking, but keep it off if you
+prefer not to relay other players' names.
+
+Required notice (Section 7.1):
+
+> © CCP hf. All rights reserved. "EVE", "EVE Online", "CCP", and all related
+> logos and images are trademarks or registered trademarks of CCP hf.
 
 ## CCP Developer License Agreement
 
